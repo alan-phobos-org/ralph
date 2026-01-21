@@ -1,5 +1,24 @@
 # Ralph Loop: Distilled Essentials
 
+## Quick Start
+
+```bash
+# Local execution
+./ralph.py "Fix all type errors" --max-iterations 15
+
+# Remote execution (SSH + repo clone)
+./ralph-remote.sh --host dev.example.com \
+  --repo https://github.com/org/repo \
+  --inner-prompt "Fix all linting errors" \
+  --max-iterations 20
+
+# Test remote configuration
+./ralph-remote.sh --host dev.example.com \
+  --repo https://github.com/org/repo \
+  --inner-prompt "Test task" \
+  --dry-run
+```
+
 ## Core Design Principles
 
 **Naive persistence beats sophisticated complexity.**
@@ -250,13 +269,104 @@ Only emit when absolutely certain task is done.
 Begin working on NEXT SINGLE task now. Remember: ONE task → Update progress.md → Commit → STOP
 ```
 
-## Usage Patterns
+## Customizing the Outer Prompt
 
-### Basic Loop
+Ralph's outer prompt (the wrapper instructions) is now externalized and customizable.
+
+### Default Outer Prompt
+
+The default outer prompt is at `prompts/outer-prompt-default.md`. It contains the two-phase workflow:
+- Phase 1: Planning (iterative refinement until detailed enough)
+- Phase 2: Implementation (one task at a time)
+
+### Custom Outer Prompt
+
+Create your own outer prompt template for specialized workflows:
 
 ```bash
-./ralph.py "Fix all type errors" --max-iterations 15
+# Create custom outer prompt
+cat > prompts/outer-prompt-aggressive.md <<'EOF'
+RALPH LOOP ITERATION {iteration_num}
+
+TASK: {user_prompt}
+
+1. Read progress.md
+2. Do ONE task
+3. Commit
+4. STOP
+
+Emit 🎯 RALPH_LOOP_COMPLETE 🎯 when done.
+EOF
+
+# Use custom outer prompt
+./ralph.py "Fix bugs" --outer-prompt prompts/outer-prompt-aggressive.md
 ```
+
+**Template variables:**
+- `{iteration_num}` - Current iteration number
+- `{user_prompt}` - User's task description
+
+## Usage Patterns
+
+### Local Execution
+
+```bash
+# Basic usage
+./ralph.py "Fix all type errors" --max-iterations 15
+
+# With custom outer prompt
+./ralph.py "Implement auth" --outer-prompt prompts/custom.md
+```
+
+### Remote Execution
+
+Execute Ralph against a remote repository via SSH:
+
+```bash
+# Basic remote execution
+./ralph-remote.sh \
+  --host dev.example.com \
+  --repo https://github.com/org/repo \
+  --inner-prompt "Fix all linting errors" \
+  --max-iterations 20
+
+# With SSH key and custom port
+./ralph-remote.sh \
+  --host dev.example.com \
+  --port 2222 \
+  --key ~/.ssh/id_rsa \
+  --user developer \
+  --repo git@github.com:org/repo.git \
+  --inner-prompt-file task.md \
+  --max-iterations 30
+
+# With custom outer prompt
+./ralph-remote.sh \
+  --host dev.example.com \
+  --repo https://github.com/org/repo \
+  --inner-prompt "Test all features" \
+  --outer-prompt prompts/outer-prompt-testing.md
+
+# Test configuration (dry-run)
+./ralph-remote.sh \
+  --host dev.example.com \
+  --repo https://github.com/org/repo \
+  --inner-prompt "Test" \
+  --dry-run
+```
+
+**How ralph-remote.sh works:**
+1. SSH to specified host
+2. Clone the repository to working directory
+3. Remove git remote (prevents accidental pushes)
+4. Copy Ralph script, outer prompt, and inner prompt to `.ralph/`
+5. Execute Ralph with specified configuration
+6. Leave results in remote working directory
+
+**Security notes:**
+- The remote's git origin is removed to prevent accidental pushes
+- Results remain on the remote host for review before pushing
+- Use `--dry-run` to test SSH and configuration without execution
 
 ### Human-in-the-Loop (recommended for learning)
 
