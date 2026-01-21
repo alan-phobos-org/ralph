@@ -9,16 +9,63 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Default values
+# Load environment variables from .env file
+load_env_file() {
+    local env_file="$1"
+
+    if [[ ! -f "$env_file" ]]; then
+        return 0
+    fi
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # Skip comments and blank lines
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${line// }" ]] && continue
+
+        # Handle both "KEY=value" and "export KEY=value"
+        if [[ "$line" =~ ^export[[:space:]]+([A-Z_][A-Z0-9_]*)=(.*)$ ]] || \
+           [[ "$line" =~ ^([A-Z_][A-Z0-9_]*)=(.*)$ ]]; then
+            local key="${BASH_REMATCH[1]}"
+            local value="${BASH_REMATCH[2]}"
+
+            # Remove surrounding quotes
+            value="${value%\"}"
+            value="${value#\"}"
+            value="${value%\'}"
+            value="${value#\'}"
+
+            export "$key=$value"
+        fi
+    done < "$env_file"
+}
+
+# Expand tilde in paths
+expand_tilde() {
+    local path="$1"
+    if [[ "$path" =~ ^\~ ]] && [[ -n "${HOME:-}" ]]; then
+        echo "${path/#\~/$HOME}"
+    else
+        echo "$path"
+    fi
+}
+
+# Load .env file (script dir first, then current dir)
+if [[ -f "${SCRIPT_DIR}/.env" ]]; then
+    load_env_file "${SCRIPT_DIR}/.env"
+elif [[ -f "$(pwd)/.env" ]]; then
+    load_env_file "$(pwd)/.env"
+fi
+
+# Default values with environment variable fallbacks
 RALPH_SCRIPT="${SCRIPT_DIR}/ralph.py"
 DEFAULT_OUTER_PROMPT="${SCRIPT_DIR}/prompts/outer-prompt-default.md"
-SSH_PORT=22
-WORKING_DIR="."
+SSH_PORT="${RALPH_REMOTE_PORT:-22}"
+WORKING_DIR="${RALPH_REMOTE_WORKING_DIR:-.}"
 DRY_RUN=false
-MAX_ITERATIONS=10
-MAX_TURNS=50
-MODEL="opus"
-CLI_TYPE="claude"
+MAX_ITERATIONS="${RALPH_REMOTE_MAX_ITERATIONS:-10}"
+MAX_TURNS="${RALPH_REMOTE_MAX_TURNS:-50}"
+MODEL="${RALPH_REMOTE_MODEL:-opus}"
+CLI_TYPE="${RALPH_REMOTE_CLI_TYPE:-claude}"
 RESUME_MODE=false
 SESSION_NAME=""
 
@@ -60,6 +107,36 @@ Ralph options:
   --model MODEL          Claude model: opus|sonnet|haiku (default: opus)
   --cli-type TYPE        CLI type: claude|codex (default: claude)
   --dry-run              Show what would be executed without running
+  --show-config          Display effective configuration and exit
+
+Environment Variables:
+  Configuration options can be set via environment variables or loaded from
+  a .env file in the script directory or current directory. CLI arguments
+  override environment variables.
+
+  RALPH_REMOTE_HOST              SSH host to connect to
+  RALPH_REMOTE_PORT              SSH port (default: 22)
+  RALPH_REMOTE_KEY               SSH private key file (supports ~/)
+  RALPH_REMOTE_USER              SSH user
+  RALPH_REMOTE_REPO              Git repository URL
+  RALPH_REMOTE_WORKING_DIR       Working directory (default: .)
+  RALPH_REMOTE_MAX_ITERATIONS    Maximum iterations (default: 10)
+  RALPH_REMOTE_MAX_TURNS         Maximum turns (default: 50)
+  RALPH_REMOTE_MODEL             Claude model (default: opus)
+  RALPH_REMOTE_CLI_TYPE          CLI type (default: claude)
+  RALPH_REMOTE_OUTER_PROMPT      Outer prompt template (supports ~/)
+
+  Example .env file:
+    RALPH_REMOTE_HOST=135.181.155.74
+    RALPH_REMOTE_PORT=28244
+    RALPH_REMOTE_KEY=~/.ssh/id_rsa
+    RALPH_REMOTE_REPO=https://github.com/org/repo
+
+  Configuration priority (highest wins):
+    1. CLI arguments
+    2. Shell environment variables
+    3. .env file
+    4. Script defaults
 
 Examples:
   # Start new Ralph session (detaches after setup)
@@ -83,14 +160,14 @@ EOF
     exit 1
 }
 
-# Parse arguments
+# Parse arguments - initialize from environment variables
 INNER_PROMPT=""
 INNER_PROMPT_FILE=""
-HOST=""
-REPO_URL=""
-SSH_KEY=""
-SSH_USER=""
-OUTER_PROMPT="$DEFAULT_OUTER_PROMPT"
+HOST="${RALPH_REMOTE_HOST:-}"
+REPO_URL="${RALPH_REMOTE_REPO:-}"
+SSH_KEY="$(expand_tilde "${RALPH_REMOTE_KEY:-}")"
+SSH_USER="${RALPH_REMOTE_USER:-}"
+OUTER_PROMPT="$(expand_tilde "${RALPH_REMOTE_OUTER_PROMPT:-$DEFAULT_OUTER_PROMPT}")"
 LIST_SESSIONS=false
 
 while [[ $# -gt 0 ]]; do
@@ -164,6 +241,10 @@ while [[ $# -gt 0 ]]; do
             DRY_RUN=true
             shift
             ;;
+        --show-config)
+            SHOW_CONFIG=true
+            shift
+            ;;
         --help|-h)
             usage
             ;;
@@ -174,9 +255,27 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Show effective configuration if requested
+if [[ "${SHOW_CONFIG:-false}" == "true" ]]; then
+    echo "Effective Configuration:"
+    echo "======================="
+    echo "HOST:             ${HOST:-<not set>}"
+    echo "SSH_PORT:         $SSH_PORT"
+    echo "SSH_KEY:          ${SSH_KEY:-<not set>}"
+    echo "SSH_USER:         ${SSH_USER:-<not set>}"
+    echo "REPO_URL:         ${REPO_URL:-<not set>}"
+    echo "WORKING_DIR:      $WORKING_DIR"
+    echo "MAX_ITERATIONS:   $MAX_ITERATIONS"
+    echo "MAX_TURNS:        $MAX_TURNS"
+    echo "MODEL:            $MODEL"
+    echo "CLI_TYPE:         $CLI_TYPE"
+    echo "OUTER_PROMPT:     $OUTER_PROMPT"
+    exit 0
+fi
+
 # Validate required arguments
 if [[ -z "$HOST" ]]; then
-    echo "Error: --host is required"
+    echo "Error: --host is required (or set RALPH_REMOTE_HOST in .env file)" >&2
     usage
 fi
 
@@ -223,7 +322,7 @@ fi
 
 # Start mode validation
 if [[ -z "$REPO_URL" ]]; then
-    echo "Error: --repo is required for start mode"
+    echo "Error: --repo is required for start mode (or set RALPH_REMOTE_REPO in .env file)" >&2
     echo "Use --resume SESSION to reattach to existing session"
     usage
 fi

@@ -20,6 +20,52 @@
 ./ralph-remote.sh --host dev.example.com --list
 ```
 
+## Configuration
+
+ralph-remote.sh supports configuration via environment variables loaded from a `.env` file.
+
+### Using .env File
+
+Create a `.env` file in the ralph directory:
+
+```bash
+RALPH_REMOTE_HOST=135.181.155.74
+RALPH_REMOTE_PORT=28244
+RALPH_REMOTE_KEY=~/.ssh/h2ai
+RALPH_REMOTE_REPO=https://github.com/org/repo
+RALPH_REMOTE_MAX_ITERATIONS=20
+```
+
+Then run with minimal arguments:
+
+```bash
+./ralph-remote.sh --inner-prompt "Fix all type errors"
+```
+
+### Configuration Priority
+
+Configuration sources are applied in this order (highest priority wins):
+1. CLI arguments
+2. Shell environment variables
+3. `.env` file
+4. Script defaults
+
+### Supported Environment Variables
+
+- `RALPH_REMOTE_HOST` - SSH host to connect to
+- `RALPH_REMOTE_PORT` - SSH port (default: 22)
+- `RALPH_REMOTE_KEY` - SSH private key file (supports `~/`)
+- `RALPH_REMOTE_USER` - SSH user
+- `RALPH_REMOTE_REPO` - Git repository URL
+- `RALPH_REMOTE_WORKING_DIR` - Working directory (default: .)
+- `RALPH_REMOTE_MAX_ITERATIONS` - Maximum iterations (default: 10)
+- `RALPH_REMOTE_MAX_TURNS` - Maximum turns (default: 50)
+- `RALPH_REMOTE_MODEL` - Claude model (default: opus)
+- `RALPH_REMOTE_CLI_TYPE` - CLI type (default: claude)
+- `RALPH_REMOTE_OUTER_PROMPT` - Outer prompt template (supports `~/`)
+
+For complete details, run `./ralph-remote.sh --help`
+
 ## Core Design Principles
 
 **Naive persistence beats sophisticated complexity.**
