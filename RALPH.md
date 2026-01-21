@@ -6,17 +6,18 @@
 # Local execution
 ./ralph.py "Fix all type errors" --max-iterations 15
 
-# Remote execution (SSH + repo clone)
+# Remote execution in tmux (detached mode)
 ./ralph-remote.sh --host dev.example.com \
   --repo https://github.com/org/repo \
   --inner-prompt "Fix all linting errors" \
   --max-iterations 20
 
-# Test remote configuration
+# Resume existing remote session
 ./ralph-remote.sh --host dev.example.com \
-  --repo https://github.com/org/repo \
-  --inner-prompt "Test task" \
-  --dry-run
+  --resume ralph-myrepo-20260121-183045
+
+# List remote sessions
+./ralph-remote.sh --host dev.example.com --list
 ```
 
 ## Core Design Principles
@@ -320,7 +321,9 @@ EOF
 
 ### Remote Execution
 
-Execute Ralph against a remote repository via SSH:
+Execute Ralph against a remote repository via SSH in a tmux session. Ralph runs detached and you can resume anytime.
+
+#### Start Mode (creates new session)
 
 ```bash
 # Basic remote execution
@@ -340,12 +343,12 @@ Execute Ralph against a remote repository via SSH:
   --inner-prompt-file task.md \
   --max-iterations 30
 
-# With custom outer prompt
+# With custom session name
 ./ralph-remote.sh \
   --host dev.example.com \
   --repo https://github.com/org/repo \
   --inner-prompt "Test all features" \
-  --outer-prompt prompts/outer-prompt-testing.md
+  --session-name my-ralph-task
 
 # Test configuration (dry-run)
 ./ralph-remote.sh \
@@ -355,18 +358,48 @@ Execute Ralph against a remote repository via SSH:
   --dry-run
 ```
 
+#### Resume Mode (attach to existing session)
+
+```bash
+# List all Ralph sessions on remote host
+./ralph-remote.sh --host dev.example.com --list
+
+# Resume specific session
+./ralph-remote.sh --host dev.example.com --resume ralph-myrepo-20260121-183045
+
+# Detach from session once attached
+# Press: Ctrl+b d
+```
+
+#### Monitoring
+
+```bash
+# View logs without attaching
+ssh dev.example.com 'tail -f ./myrepo/.ralph/ralph.log'
+
+# Kill a session
+ssh dev.example.com 'tmux kill-session -t ralph-myrepo-20260121-183045'
+```
+
 **How ralph-remote.sh works:**
 1. SSH to specified host
 2. Clone the repository to working directory
 3. Remove git remote (prevents accidental pushes)
 4. Copy Ralph script, outer prompt, and inner prompt to `.ralph/`
-5. Execute Ralph with specified configuration
-6. Leave results in remote working directory
+5. Create detached tmux session with unique name (ralph-REPO-TIMESTAMP)
+6. Start Ralph in tmux session with logging to `.ralph/ralph.log`
+7. Return immediately (Ralph continues running in background)
+
+**Resume mode:**
+1. SSH to specified host
+2. Reattach to existing tmux session
+3. Interactive session (Ctrl+b d to detach again)
 
 **Security notes:**
 - The remote's git origin is removed to prevent accidental pushes
 - Results remain on the remote host for review before pushing
 - Use `--dry-run` to test SSH and configuration without execution
+- Sessions persist until killed or host reboot
 
 ### Human-in-the-Loop (recommended for learning)
 

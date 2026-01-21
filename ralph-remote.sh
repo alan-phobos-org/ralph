@@ -1,14 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ralph-remote.sh: Execute Ralph against a remote repository
+# ralph-remote.sh: Execute Ralph against a remote repository in tmux
 #
-# This script:
-# 1. SSH to specified host
-# 2. Clone the target repo to a working directory
-# 3. Remove the remote to prevent accidental pushes
-# 4. Copy up Ralph, outer prompt, and inner prompt
-# 5. Run Ralph with the specified task
+# This script supports two modes:
+# 1. Start mode: Clone repo, setup Ralph, start in tmux, detach
+# 2. Resume mode: Reattach to existing tmux session
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -22,20 +19,30 @@ MAX_ITERATIONS=10
 MAX_TURNS=50
 MODEL="opus"
 CLI_TYPE="claude"
+RESUME_MODE=false
+SESSION_NAME=""
 
 usage() {
     cat <<EOF
-Usage: $0 [OPTIONS] --host HOST --repo REPO_URL --inner-prompt PROMPT
+Usage: $0 [OPTIONS] --host HOST [--resume SESSION | --repo REPO_URL --inner-prompt PROMPT]
 
-Execute Ralph against a remote repository via SSH.
+Execute Ralph against a remote repository via SSH in a detached tmux session.
+
+Modes:
+  Start mode:  Start new Ralph session in tmux (requires --repo and prompt)
+  Resume mode: Reattach to existing Ralph session (requires --resume)
 
 Required arguments:
   --host HOST              SSH host to connect to
-  --repo REPO_URL         Git repository URL to clone
 
-Prompt arguments (one required):
+Start mode arguments:
+  --repo REPO_URL         Git repository URL to clone
   --inner-prompt PROMPT   Inner prompt (task description) to pass to Ralph
   --inner-prompt-file FILE  Read inner prompt from file
+
+Resume mode arguments:
+  --resume SESSION        Reattach to existing tmux session
+  --list                  List all Ralph sessions on remote host
 
 SSH options:
   --port PORT             SSH port (default: 22)
@@ -45,6 +52,7 @@ SSH options:
 Remote execution options:
   --working-dir DIR       Working directory on remote host (default: .)
   --outer-prompt FILE     Outer prompt template file (default: prompts/outer-prompt-default.md)
+  --session-name NAME     Custom tmux session name (default: ralph-REPO_NAME-TIMESTAMP)
 
 Ralph options:
   --max-iterations N      Maximum Ralph iterations (default: 10)
@@ -54,14 +62,19 @@ Ralph options:
   --dry-run              Show what would be executed without running
 
 Examples:
-  # Basic usage with inline prompt
+  # Start new Ralph session (detaches after setup)
   $0 --host dev.example.com --repo https://github.com/org/repo \\
      --inner-prompt "Fix all type errors"
 
-  # Using SSH key and custom port
-  $0 --host dev.example.com --port 2222 --key ~/.ssh/id_rsa \\
-     --repo git@github.com:org/repo.git \\
-     --inner-prompt-file task.md --max-iterations 20
+  # List existing Ralph sessions on remote
+  $0 --host dev.example.com --list
+
+  # Resume existing Ralph session
+  $0 --host dev.example.com --resume ralph-myrepo-20260121-183045
+
+  # Start with custom session name
+  $0 --host dev.example.com --repo https://github.com/org/repo \\
+     --inner-prompt "Fix bugs" --session-name my-ralph-session
 
   # Dry run to test configuration
   $0 --host dev.example.com --repo https://github.com/org/repo \\
@@ -78,6 +91,7 @@ REPO_URL=""
 SSH_KEY=""
 SSH_USER=""
 OUTER_PROMPT="$DEFAULT_OUTER_PROMPT"
+LIST_SESSIONS=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -117,6 +131,10 @@ while [[ $# -gt 0 ]]; do
             OUTER_PROMPT="$2"
             shift 2
             ;;
+        --session-name)
+            SESSION_NAME="$2"
+            shift 2
+            ;;
         --max-iterations)
             MAX_ITERATIONS="$2"
             shift 2
@@ -132,6 +150,15 @@ while [[ $# -gt 0 ]]; do
         --cli-type)
             CLI_TYPE="$2"
             shift 2
+            ;;
+        --resume)
+            RESUME_MODE=true
+            SESSION_NAME="$2"
+            shift 2
+            ;;
+        --list)
+            LIST_SESSIONS=true
+            shift
             ;;
         --dry-run)
             DRY_RUN=true
@@ -153,13 +180,56 @@ if [[ -z "$HOST" ]]; then
     usage
 fi
 
+# Build SSH command
+SSH_CMD="ssh -p $SSH_PORT"
+if [[ -n "$SSH_KEY" ]]; then
+    SSH_CMD="$SSH_CMD -i $SSH_KEY"
+fi
+if [[ -n "$SSH_USER" ]]; then
+    SSH_CMD="$SSH_CMD ${SSH_USER}@${HOST}"
+else
+    SSH_CMD="$SSH_CMD $HOST"
+fi
+
+# Handle list mode
+if [[ "$LIST_SESSIONS" == "true" ]]; then
+    echo "Ralph sessions on $HOST:"
+    echo "=========================================="
+    $SSH_CMD "tmux list-sessions 2>/dev/null | grep '^ralph-' || echo 'No Ralph sessions found'"
+    exit 0
+fi
+
+# Handle resume mode
+if [[ "$RESUME_MODE" == "true" ]]; then
+    if [[ -z "$SESSION_NAME" ]]; then
+        echo "Error: --resume requires a session name"
+        echo ""
+        echo "List available sessions with: $0 --host $HOST --list"
+        exit 1
+    fi
+
+    echo "=========================================="
+    echo "Resuming Ralph Remote Session"
+    echo "=========================================="
+    echo "Host:    $HOST:$SSH_PORT"
+    echo "Session: $SESSION_NAME"
+    echo "=========================================="
+    echo ""
+    echo "Attaching to tmux session (press Ctrl+b d to detach)..."
+    echo ""
+
+    exec $SSH_CMD -t "tmux attach-session -t ${SESSION_NAME}"
+fi
+
+# Start mode validation
 if [[ -z "$REPO_URL" ]]; then
-    echo "Error: --repo is required"
+    echo "Error: --repo is required for start mode"
+    echo "Use --resume SESSION to reattach to existing session"
     usage
 fi
 
 if [[ -z "$INNER_PROMPT" && -z "$INNER_PROMPT_FILE" ]]; then
-    echo "Error: Either --inner-prompt or --inner-prompt-file is required"
+    echo "Error: Either --inner-prompt or --inner-prompt-file is required for start mode"
     usage
 fi
 
@@ -183,28 +253,23 @@ if [[ ! -f "$OUTER_PROMPT" ]]; then
     exit 1
 fi
 
-# Build SSH command
-SSH_CMD="ssh -p $SSH_PORT"
-if [[ -n "$SSH_KEY" ]]; then
-    SSH_CMD="$SSH_CMD -i $SSH_KEY"
-fi
-if [[ -n "$SSH_USER" ]]; then
-    SSH_CMD="$SSH_CMD ${SSH_USER}@${HOST}"
-else
-    SSH_CMD="$SSH_CMD $HOST"
+# Extract repo name and create session name
+REPO_NAME=$(basename "$REPO_URL" .git)
+if [[ -z "$SESSION_NAME" ]]; then
+    TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+    SESSION_NAME="ralph-${REPO_NAME}-${TIMESTAMP}"
 fi
 
-# Extract repo name for working directory
-REPO_NAME=$(basename "$REPO_URL" .git)
 REMOTE_WORK_DIR="${WORKING_DIR}/${REPO_NAME}"
 REMOTE_RALPH_DIR="${REMOTE_WORK_DIR}/.ralph"
 
 echo "=========================================="
-echo "Ralph Remote Execution"
+echo "Ralph Remote Execution (Start Mode)"
 echo "=========================================="
 echo "Host:             $HOST:$SSH_PORT"
 echo "Repository:       $REPO_URL"
 echo "Remote work dir:  $REMOTE_WORK_DIR"
+echo "Session name:     $SESSION_NAME"
 echo "Inner prompt:     ${INNER_PROMPT:0:50}..."
 echo "Outer prompt:     $OUTER_PROMPT"
 echo "Max iterations:   $MAX_ITERATIONS"
@@ -219,32 +284,32 @@ if [[ "$DRY_RUN" == "true" ]]; then
     echo ""
     echo "1. SSH command: $SSH_CMD"
     echo ""
-    echo "2. Remote commands:"
-    cat <<'REMOTE_SCRIPT'
+    echo "2. Remote setup commands:"
+    cat <<REMOTE_SCRIPT
     # Clone repository
-    git clone REPO_URL REMOTE_WORK_DIR
-    cd REMOTE_WORK_DIR
-
-    # Remove remote to prevent accidental pushes
+    git clone ${REPO_URL} ${REMOTE_WORK_DIR}
+    cd ${REMOTE_WORK_DIR}
     git remote remove origin
 
-    # Create Ralph directory
+    # Create Ralph directory and copy files
     mkdir -p .ralph/prompts
+    # (ralph.py, prompts, inner-prompt.md copied via scp)
 
-    # Copy files (would be done via scp/rsync)
-    # - ralph.py -> .ralph/
-    # - outer-prompt.md -> .ralph/prompts/
-    # - inner-prompt.md -> .ralph/
+    # Create tmux session
+    tmux new-session -d -s ${SESSION_NAME} -c ${REMOTE_WORK_DIR}
 
-    # Execute Ralph
-    python3 .ralph/ralph.py \
-        --prompt-file .ralph/inner-prompt.md \
-        --outer-prompt .ralph/prompts/outer-prompt.md \
-        --max-iterations MAX_ITERATIONS \
-        --max-turns MAX_TURNS \
-        --model MODEL \
-        --cli-type CLI_TYPE
+    # Start Ralph in tmux session
+    tmux send-keys -t ${SESSION_NAME} "python3 .ralph/ralph.py \\
+        --prompt-file .ralph/inner-prompt.md \\
+        --outer-prompt .ralph/prompts/outer-prompt.md \\
+        --max-iterations ${MAX_ITERATIONS} \\
+        --max-turns ${MAX_TURNS} \\
+        --model ${MODEL} \\
+        --cli-type ${CLI_TYPE} 2>&1 | tee .ralph/ralph.log" C-m
 REMOTE_SCRIPT
+    echo ""
+    echo "3. Resume with:"
+    echo "   $0 --host $HOST --resume ${SESSION_NAME}"
     echo ""
     echo "DRY RUN complete. Use without --dry-run to execute."
     exit 0
@@ -262,16 +327,20 @@ echo "$INNER_PROMPT" > "$TEMP_DIR/inner-prompt.md"
 echo ""
 echo "Step 1: Setting up remote environment..."
 
-# Create remote working directory and Ralph directory
-$SSH_CMD "mkdir -p ${REMOTE_WORK_DIR}"
+# Create remote working directory
+$SSH_CMD "mkdir -p ${REMOTE_WORK_DIR}" 2>/dev/null || true
 
 echo "Step 2: Cloning repository..."
 
-# Clone repository on remote
-$SSH_CMD "cd ${WORKING_DIR} && git clone ${REPO_URL} ${REPO_NAME} 2>&1" || {
-    echo "Error: Failed to clone repository"
-    exit 1
-}
+# Clone repository on remote (skip if already exists)
+if $SSH_CMD "test -d ${REMOTE_WORK_DIR}/.git"; then
+    echo "Repository already exists at ${REMOTE_WORK_DIR}, skipping clone..."
+else
+    $SSH_CMD "cd ${WORKING_DIR} && git clone ${REPO_URL} ${REPO_NAME}" || {
+        echo "Error: Failed to clone repository"
+        exit 1
+    }
+fi
 
 echo "Step 3: Removing git remote..."
 
@@ -313,33 +382,50 @@ $SCP_CMD "$TEMP_DIR/inner-prompt.md" "${SCP_TARGET}:${REMOTE_RALPH_DIR}/" || {
 echo "Step 6: Making ralph.py executable..."
 $SSH_CMD "chmod +x ${REMOTE_RALPH_DIR}/ralph.py"
 
-echo ""
-echo "=========================================="
-echo "Starting Ralph execution on remote host..."
-echo "=========================================="
-echo ""
+echo "Step 7: Creating tmux session..."
 
-# Execute Ralph on remote
-$SSH_CMD "cd ${REMOTE_WORK_DIR} && python3 .ralph/ralph.py \
+# Check if session already exists
+if $SSH_CMD "tmux has-session -t ${SESSION_NAME} 2>/dev/null"; then
+    echo "Error: tmux session '${SESSION_NAME}' already exists"
+    echo "Use --resume ${SESSION_NAME} to attach, or choose a different --session-name"
+    exit 1
+fi
+
+# Create detached tmux session
+$SSH_CMD "tmux new-session -d -s ${SESSION_NAME} -c ${REMOTE_WORK_DIR}"
+
+echo "Step 8: Starting Ralph in tmux session..."
+
+# Start Ralph in the tmux session with logging
+$SSH_CMD "tmux send-keys -t ${SESSION_NAME} 'python3 .ralph/ralph.py \
     --prompt-file .ralph/inner-prompt.md \
     --outer-prompt .ralph/prompts/outer-prompt.md \
     --max-iterations ${MAX_ITERATIONS} \
     --max-turns ${MAX_TURNS} \
     --model ${MODEL} \
-    --cli-type ${CLI_TYPE}"
-
-RALPH_EXIT_CODE=$?
+    --cli-type ${CLI_TYPE} 2>&1 | tee .ralph/ralph.log' C-m"
 
 echo ""
 echo "=========================================="
-echo "Ralph execution completed"
-echo "Exit code: $RALPH_EXIT_CODE"
+echo "Ralph session started successfully"
 echo "=========================================="
 echo ""
-echo "Remote working directory: ${REMOTE_WORK_DIR}"
-echo "To access results:"
-echo "  $SSH_CMD"
-echo "  cd ${REMOTE_WORK_DIR}"
+echo "Session name:    $SESSION_NAME"
+echo "Working dir:     $REMOTE_WORK_DIR"
+echo "Log file:        $REMOTE_WORK_DIR/.ralph/ralph.log"
 echo ""
-
-exit $RALPH_EXIT_CODE
+echo "To attach to the session:"
+echo "  $0 --host $HOST --resume $SESSION_NAME"
+echo ""
+echo "To detach once attached:"
+echo "  Press: Ctrl+b d"
+echo ""
+echo "To list all sessions:"
+echo "  $0 --host $HOST --list"
+echo ""
+echo "To view logs without attaching:"
+echo "  $SSH_CMD 'tail -f ${REMOTE_WORK_DIR}/.ralph/ralph.log'"
+echo ""
+echo "To kill the session:"
+echo "  $SSH_CMD 'tmux kill-session -t $SESSION_NAME'"
+echo ""
