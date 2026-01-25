@@ -51,6 +51,45 @@ class IterationResult:
     output: str
     error: Optional[str] = None
     iteration_num: int = 0
+    max_turns_reached: bool = False
+    timeout_occurred: bool = False
+    feedback_summary: Optional[str] = None
+
+
+def extract_iteration_feedback(result: IterationResult) -> str:
+    """Extract feedback from iteration result to pass to next iteration."""
+    feedback_parts = []
+
+    # Check for max turns
+    if result.max_turns_reached:
+        feedback_parts.append(
+            "⚠️ PREVIOUS ITERATION HIT MAX TURNS LIMIT\n"
+            "The last iteration was stopped because it reached the maximum turn limit.\n"
+            "This usually means the plan has tasks that are too large or complex.\n"
+            "GUIDANCE: Break down the current task into smaller, more focused steps."
+        )
+
+    # Check for timeout
+    if result.timeout_occurred:
+        feedback_parts.append(
+            "⚠️ PREVIOUS ITERATION TIMED OUT\n"
+            "The last iteration exceeded the time limit.\n"
+            "GUIDANCE: Simplify the current task or break it into smaller pieces."
+        )
+
+    # Check for general errors
+    if result.error and not result.max_turns_reached and not result.timeout_occurred:
+        feedback_parts.append(
+            f"⚠️ PREVIOUS ITERATION ENCOUNTERED AN ERROR\n"
+            f"Error: {result.error[:500]}\n"
+            f"GUIDANCE: Address this error before proceeding."
+        )
+
+    # If no specific feedback, indicate success
+    if not feedback_parts and result.success:
+        return "✅ Previous iteration completed successfully."
+
+    return "\n\n".join(feedback_parts) if feedback_parts else "No feedback from previous iteration."
 
 
 def check_for_commit(result: IterationResult) -> bool:
@@ -90,15 +129,21 @@ def load_outer_prompt(outer_prompt_path: str) -> str:
         sys.exit(1)
 
 
-def create_wrapped_prompt(user_prompt: str, iteration_num: int, outer_prompt_template: str) -> str:
+def create_wrapped_prompt(user_prompt: str, iteration_num: int, outer_prompt_template: str, feedback: Optional[str] = None) -> str:
     """Wrap user prompt with Ralph Loop instructions from template."""
+    # Include feedback in the template if provided
+    feedback_section = ""
+    if feedback and iteration_num > 1:
+        feedback_section = f"\n\n{'='*60}\nFEEDBACK FROM PREVIOUS ITERATION:\n{'='*60}\n{feedback}\n{'='*60}\n"
+
     return outer_prompt_template.format(
         iteration_num=iteration_num,
-        user_prompt=user_prompt
+        user_prompt=user_prompt,
+        feedback=feedback_section
     )
 
 
-def run_claude_iteration(prompt: str, model: str = 'opus', max_turns: int = 50, timeout: int = 600) -> IterationResult:
+def run_claude_iteration(prompt: str, model: str = 'opus', max_turns: int = 50, timeout: int = 600, log_file: Optional[TextIO] = None) -> IterationResult:
     """Run one iteration using Claude Code CLI."""
     cmd = [
         'claude',
@@ -113,6 +158,16 @@ def run_claude_iteration(prompt: str, model: str = 'opus', max_turns: int = 50, 
     env = os.environ.copy()
     env['CLAUDE_CODE_YOLO'] = '1'
 
+    # Log command and environment to file
+    if log_file:
+        log_file.write(f"\n{'='*80}\n")
+        log_file.write(f"COMMAND: {' '.join(cmd)}\n")
+        log_file.write(f"ENV: CLAUDE_CODE_YOLO={env.get('CLAUDE_CODE_YOLO')}\n")
+        log_file.write(f"TIMEOUT: {timeout}s\n")
+        log_file.write(f"PROMPT LENGTH: {len(prompt)} chars\n")
+        log_file.write(f"{'='*80}\n")
+        log_file.flush()
+
     try:
         result = subprocess.run(
             cmd,
@@ -121,26 +176,59 @@ def run_claude_iteration(prompt: str, model: str = 'opus', max_turns: int = 50, 
             timeout=timeout,
             env=env
         )
+
+        # Log full output to file
+        if log_file:
+            log_file.write(f"\nRETURN CODE: {result.returncode}\n")
+            log_file.write(f"\n--- STDOUT ({len(result.stdout)} chars) ---\n")
+            log_file.write(result.stdout)
+            log_file.write(f"\n--- STDERR ({len(result.stderr)} chars) ---\n")
+            log_file.write(result.stderr)
+            log_file.write(f"\n{'='*80}\n")
+            log_file.flush()
+
+        # Check for max turns error
+        max_turns_reached = False
+        combined_output = result.stdout + result.stderr
+        if 'max turns' in combined_output.lower() or 'reached max turns' in combined_output.lower():
+            max_turns_reached = True
+
         return IterationResult(
             success=result.returncode == 0,
             output=result.stdout,
-            error=result.stderr if result.returncode != 0 else None
+            error=result.stderr if result.returncode != 0 else None,
+            max_turns_reached=max_turns_reached
         )
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as e:
+        error_msg = f'Iteration timed out after {timeout} seconds'
+        if log_file:
+            log_file.write(f"\n❌ TIMEOUT ERROR: {error_msg}\n")
+            if e.stdout:
+                log_file.write(f"\nPartial STDOUT:\n{e.stdout}\n")
+            if e.stderr:
+                log_file.write(f"\nPartial STDERR:\n{e.stderr}\n")
+            log_file.flush()
         return IterationResult(
             success=False,
-            output='',
-            error=f'Iteration timed out after {timeout} seconds'
+            output=e.stdout.decode() if e.stdout else '',
+            error=error_msg,
+            timeout_occurred=True
         )
     except Exception as e:
+        error_msg = f'Failed to run claude: {type(e).__name__}: {e}'
+        if log_file:
+            log_file.write(f"\n❌ EXCEPTION: {error_msg}\n")
+            import traceback
+            log_file.write(traceback.format_exc())
+            log_file.flush()
         return IterationResult(
             success=False,
             output='',
-            error=f'Failed to run claude: {e}'
+            error=error_msg
         )
 
 
-def run_codex_iteration(prompt: str, timeout: int = 600) -> IterationResult:
+def run_codex_iteration(prompt: str, timeout: int = 600, log_file: Optional[TextIO] = None) -> IterationResult:
     """Run one iteration using Codex CLI."""
     cmd = [
         'codex', 'exec',
@@ -152,6 +240,16 @@ def run_codex_iteration(prompt: str, timeout: int = 600) -> IterationResult:
     env = os.environ.copy()
     env['CLAUDE_CODE_YOLO'] = '1'
 
+    # Log command and environment to file
+    if log_file:
+        log_file.write(f"\n{'='*80}\n")
+        log_file.write(f"COMMAND: {' '.join(cmd)}\n")
+        log_file.write(f"ENV: CLAUDE_CODE_YOLO={env.get('CLAUDE_CODE_YOLO')}\n")
+        log_file.write(f"TIMEOUT: {timeout}s\n")
+        log_file.write(f"PROMPT LENGTH: {len(prompt)} chars\n")
+        log_file.write(f"{'='*80}\n")
+        log_file.flush()
+
     try:
         result = subprocess.run(
             cmd,
@@ -160,22 +258,55 @@ def run_codex_iteration(prompt: str, timeout: int = 600) -> IterationResult:
             timeout=timeout,
             env=env
         )
+
+        # Log full output to file
+        if log_file:
+            log_file.write(f"\nRETURN CODE: {result.returncode}\n")
+            log_file.write(f"\n--- STDOUT ({len(result.stdout)} chars) ---\n")
+            log_file.write(result.stdout)
+            log_file.write(f"\n--- STDERR ({len(result.stderr)} chars) ---\n")
+            log_file.write(result.stderr)
+            log_file.write(f"\n{'='*80}\n")
+            log_file.flush()
+
+        # Check for max turns error
+        max_turns_reached = False
+        combined_output = result.stdout + result.stderr
+        if 'max turns' in combined_output.lower() or 'reached max turns' in combined_output.lower():
+            max_turns_reached = True
+
         return IterationResult(
             success=result.returncode == 0,
             output=result.stdout,
-            error=result.stderr if result.returncode != 0 else None
+            error=result.stderr if result.returncode != 0 else None,
+            max_turns_reached=max_turns_reached
         )
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as e:
+        error_msg = f'Iteration timed out after {timeout} seconds'
+        if log_file:
+            log_file.write(f"\n❌ TIMEOUT ERROR: {error_msg}\n")
+            if e.stdout:
+                log_file.write(f"\nPartial STDOUT:\n{e.stdout}\n")
+            if e.stderr:
+                log_file.write(f"\nPartial STDERR:\n{e.stderr}\n")
+            log_file.flush()
         return IterationResult(
             success=False,
-            output='',
-            error=f'Iteration timed out after {timeout} seconds'
+            output=e.stdout.decode() if e.stdout else '',
+            error=error_msg,
+            timeout_occurred=True
         )
     except Exception as e:
+        error_msg = f'Failed to run codex: {type(e).__name__}: {e}'
+        if log_file:
+            log_file.write(f"\n❌ EXCEPTION: {error_msg}\n")
+            import traceback
+            log_file.write(traceback.format_exc())
+            log_file.flush()
         return IterationResult(
             success=False,
             output='',
-            error=f'Failed to run codex: {e}'
+            error=error_msg
         )
 
 
@@ -337,42 +468,93 @@ Examples:
         print("="*60)
 
         start_time = datetime.now()
+        previous_result: Optional[IterationResult] = None
 
         for iteration in range(1, args.max_iterations + 1):
             print(f"\n🔄 Iteration {iteration}/{args.max_iterations}")
             print(f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             print("-"*60)
 
-            # Create wrapped prompt
-            wrapped_prompt = create_wrapped_prompt(args.prompt, iteration, outer_prompt_template)
+            # Extract feedback from previous iteration
+            feedback = None
+            if previous_result:
+                feedback = extract_iteration_feedback(previous_result)
+
+            # Create wrapped prompt with feedback
+            wrapped_prompt = create_wrapped_prompt(args.prompt, iteration, outer_prompt_template, feedback)
+
+            # Log the wrapped prompt to file
+            log_file.write(f"\n\n{'#'*80}\n")
+            log_file.write(f"# ITERATION {iteration}/{args.max_iterations}\n")
+            log_file.write(f"# {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            log_file.write(f"{'#'*80}\n")
+            log_file.write(f"\n--- WRAPPED PROMPT ---\n")
+            log_file.write(wrapped_prompt)
+            log_file.write(f"\n--- END WRAPPED PROMPT ---\n")
+            log_file.flush()
 
             # Run iteration
             if args.cli_type == 'claude':
-                result = run_claude_iteration(wrapped_prompt, args.model, args.max_turns, args.timeout)
+                result = run_claude_iteration(wrapped_prompt, args.model, args.max_turns, args.timeout, log_file)
             else:
-                result = run_codex_iteration(wrapped_prompt, args.timeout)
+                result = run_codex_iteration(wrapped_prompt, args.timeout, log_file)
 
             result.iteration_num = iteration
 
+            # Store result for next iteration's feedback
+            previous_result = result
+
             # Check for errors
             if not result.success:
-                print(f"❌ Iteration {iteration} failed:", file=sys.stderr)
+                print(f"❌ Iteration {iteration} failed", file=sys.stderr)
+                print(f"Return code: non-zero", file=sys.stderr)
+
                 if result.error:
+                    print(f"\nError message:", file=sys.stderr)
                     print(result.error, file=sys.stderr)
+
+                # Show stderr if available
+                if result.error and result.error.strip():
+                    print(f"\nStderr output:", file=sys.stderr)
+                    # Truncate very long stderr
+                    stderr_lines = result.error.split('\n')
+                    if len(stderr_lines) > 50:
+                        print('\n'.join(stderr_lines[:25]), file=sys.stderr)
+                        print(f"\n... ({len(stderr_lines) - 50} lines omitted) ...\n", file=sys.stderr)
+                        print('\n'.join(stderr_lines[-25:]), file=sys.stderr)
+                    else:
+                        print(result.error, file=sys.stderr)
+
+                # Show stdout if available (might contain useful context)
+                if result.output and result.output.strip():
+                    print(f"\nStdout output (may contain clues):", file=sys.stderr)
+                    stdout_lines = result.output.split('\n')
+                    if len(stdout_lines) > 30:
+                        print('\n'.join(stdout_lines[:15]), file=sys.stderr)
+                        print(f"\n... ({len(stdout_lines) - 30} lines omitted) ...\n", file=sys.stderr)
+                        print('\n'.join(stdout_lines[-15:]), file=sys.stderr)
+                    else:
+                        print(result.output, file=sys.stderr)
+
+                print(f"\n💡 See full details in log file: {args.log_file}", file=sys.stderr)
 
                 if args.human_in_the_loop:
                     if not human_in_the_loop():
                         break
                 continue
 
-            # Show truncated output
+            # Show truncated output to console (full output already in log file)
             output_lines = result.output.split('\n')
             if len(output_lines) > 20:
                 print('\n'.join(output_lines[:10]))
-                print(f"\n... ({len(output_lines) - 20} lines omitted) ...\n")
+                print(f"\n... ({len(output_lines) - 20} lines omitted, see log file) ...\n")
                 print('\n'.join(output_lines[-10:]))
             else:
                 print(result.output)
+
+            # Log success to file
+            log_file.write(f"\n✅ Iteration {iteration} completed successfully\n")
+            log_file.flush()
 
             # Check for completion signal
             if check_completion(result):
