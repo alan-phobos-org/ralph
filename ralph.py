@@ -11,6 +11,7 @@ import os
 import subprocess
 import sys
 import time
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -44,6 +45,87 @@ class TeeLogger:
         sys.stderr = self.stderr
 
 
+class DetailedLogger:
+    """Enhanced logger with timestamps and structured logging."""
+
+    def __init__(self, log_file: TextIO):
+        self.log_file = log_file
+        self.start_time = None
+
+    def log_event(self, event_type: str, message: str, **kwargs):
+        """Log an event with timestamp and structured data."""
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+        elapsed = ""
+        if self.start_time:
+            elapsed_sec = (datetime.now() - self.start_time).total_seconds()
+            elapsed = f" [+{elapsed_sec:.2f}s]"
+
+        log_line = f"[{timestamp}]{elapsed} [{event_type}] {message}"
+
+        if kwargs:
+            log_line += " | " + " | ".join(f"{k}={v}" for k, v in kwargs.items())
+
+        self.log_file.write(log_line + "\n")
+        self.log_file.flush()
+
+    def start_timing(self):
+        """Start timing for elapsed time calculations."""
+        self.start_time = datetime.now()
+
+    def log_subprocess_start(self, cmd: list, env_vars: dict = None):
+        """Log subprocess start with full details."""
+        self.log_event("SUBPROCESS_START", "Starting subprocess",
+                      cmd=" ".join(cmd))
+        if env_vars:
+            for key, value in env_vars.items():
+                self.log_event("ENV_VAR", f"{key}={value}")
+
+    def log_subprocess_end(self, returncode: int, duration: float):
+        """Log subprocess completion."""
+        self.log_event("SUBPROCESS_END", "Subprocess completed",
+                      returncode=returncode, duration_sec=f"{duration:.2f}")
+
+    def log_output_chunk(self, stream: str, chunk: str, length: int):
+        """Log a chunk of output being received."""
+        self.log_event("OUTPUT_CHUNK", f"Received {length} bytes from {stream}")
+
+    def log_error(self, error_type: str, error_msg: str):
+        """Log an error with details."""
+        self.log_event("ERROR", f"{error_type}: {error_msg}")
+
+    def log_timeout(self, timeout_seconds: int):
+        """Log a timeout event."""
+        self.log_event("TIMEOUT", f"Subprocess exceeded timeout of {timeout_seconds}s")
+
+
+def stream_output_reader(pipe, output_list: list, stream_name: str, logger: DetailedLogger):
+    """Read from a pipe and append to output_list, logging chunks."""
+    try:
+        for line in iter(pipe.readline, ''):
+            if line:
+                output_list.append(line)
+                logger.log_output_chunk(stream_name, line, len(line))
+    except Exception as e:
+        logger.log_error("STREAM_READ_ERROR", f"Error reading {stream_name}: {e}")
+
+
+def heartbeat_monitor(process, logger: DetailedLogger, interval: int = 30, stop_event: threading.Event = None):
+    """Monitor subprocess and log heartbeat to detect hangs."""
+    iteration = 0
+    while not stop_event.is_set():
+        iteration += 1
+        if process.poll() is None:
+            # Process still running
+            logger.log_event("HEARTBEAT", f"Process still running (check #{iteration})")
+        else:
+            # Process finished
+            logger.log_event("HEARTBEAT", "Process completed, stopping heartbeat")
+            break
+
+        # Wait for interval or until stop event
+        stop_event.wait(interval)
+
+
 @dataclass
 class IterationResult:
     """Result from a single agent iteration."""
@@ -54,6 +136,33 @@ class IterationResult:
     max_turns_reached: bool = False
     timeout_occurred: bool = False
     feedback_summary: Optional[str] = None
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+
+def estimate_tokens(text: str) -> int:
+    """
+    Estimate token count from text.
+
+    Uses a simple heuristic: characters / 4 (rough approximation).
+    For more accurate counting, would need tiktoken or anthropic SDK.
+    """
+    return len(text) // 4
+
+
+def format_context_stats(tokens: int, context_window: int = 200000) -> str:
+    """
+    Format token count with percentage of context window.
+
+    Args:
+        tokens: Number of tokens
+        context_window: Total context window size (default: 200k for Claude models)
+
+    Returns:
+        Formatted string with token count and percentage
+    """
+    percentage = (tokens / context_window) * 100
+    return f"{tokens:,} tokens ({percentage:.1f}% of {context_window:,})"
 
 
 def extract_iteration_feedback(result: IterationResult) -> str:
@@ -144,7 +253,7 @@ def create_wrapped_prompt(user_prompt: str, iteration_num: int, outer_prompt_tem
 
 
 def run_claude_iteration(prompt: str, model: str = 'opus', max_turns: int = 50, timeout: int = 600, log_file: Optional[TextIO] = None) -> IterationResult:
-    """Run one iteration using Claude Code CLI."""
+    """Run one iteration using Claude Code CLI with detailed logging and streaming output."""
     cmd = [
         'claude',
         '--print',
@@ -158,6 +267,9 @@ def run_claude_iteration(prompt: str, model: str = 'opus', max_turns: int = 50, 
     env = os.environ.copy()
     env['CLAUDE_CODE_YOLO'] = '1'
 
+    # Initialize detailed logger
+    logger = DetailedLogger(log_file) if log_file else None
+
     # Log command and environment to file
     if log_file:
         log_file.write(f"\n{'='*80}\n")
@@ -168,68 +280,167 @@ def run_claude_iteration(prompt: str, model: str = 'opus', max_turns: int = 50, 
         log_file.write(f"{'='*80}\n")
         log_file.flush()
 
+    if logger:
+        logger.start_timing()
+        logger.log_subprocess_start(cmd, {'CLAUDE_CODE_YOLO': '1'})
+
+    execution_start = datetime.now()
+
     try:
-        result = subprocess.run(
+        # Use Popen for streaming output
+        process = subprocess.Popen(
             cmd,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout,
-            env=env
+            env=env,
+            bufsize=1  # Line buffered
         )
 
-        # Log full output to file
-        if log_file:
-            log_file.write(f"\nRETURN CODE: {result.returncode}\n")
-            log_file.write(f"\n--- STDOUT ({len(result.stdout)} chars) ---\n")
-            log_file.write(result.stdout)
-            log_file.write(f"\n--- STDERR ({len(result.stderr)} chars) ---\n")
-            log_file.write(result.stderr)
-            log_file.write(f"\n{'='*80}\n")
-            log_file.flush()
+        # Lists to collect output
+        stdout_lines = []
+        stderr_lines = []
 
-        # Check for max turns error
-        max_turns_reached = False
-        combined_output = result.stdout + result.stderr
-        if 'max turns' in combined_output.lower() or 'reached max turns' in combined_output.lower():
-            max_turns_reached = True
+        # Create stop event for heartbeat
+        stop_event = threading.Event()
 
-        return IterationResult(
-            success=result.returncode == 0,
-            output=result.stdout,
-            error=result.stderr if result.returncode != 0 else None,
-            max_turns_reached=max_turns_reached
+        # Start threads to read output
+        stdout_thread = threading.Thread(
+            target=stream_output_reader,
+            args=(process.stdout, stdout_lines, 'stdout', logger or DetailedLogger(open('/dev/null', 'w')))
         )
-    except subprocess.TimeoutExpired as e:
-        error_msg = f'Iteration timed out after {timeout} seconds'
-        if log_file:
-            log_file.write(f"\n❌ TIMEOUT ERROR: {error_msg}\n")
-            if e.stdout:
-                log_file.write(f"\nPartial STDOUT:\n{e.stdout}\n")
-            if e.stderr:
-                log_file.write(f"\nPartial STDERR:\n{e.stderr}\n")
-            log_file.flush()
-        return IterationResult(
-            success=False,
-            output=e.stdout.decode() if e.stdout else '',
-            error=error_msg,
-            timeout_occurred=True
+        stderr_thread = threading.Thread(
+            target=stream_output_reader,
+            args=(process.stderr, stderr_lines, 'stderr', logger or DetailedLogger(open('/dev/null', 'w')))
         )
+        heartbeat_thread = threading.Thread(
+            target=heartbeat_monitor,
+            args=(process, logger or DetailedLogger(open('/dev/null', 'w')), 30, stop_event)
+        )
+
+        stdout_thread.daemon = True
+        stderr_thread.daemon = True
+        heartbeat_thread.daemon = True
+        stdout_thread.start()
+        stderr_thread.start()
+        heartbeat_thread.start()
+
+        # Wait for process with timeout
+        try:
+            returncode = process.wait(timeout=timeout)
+            duration = (datetime.now() - execution_start).total_seconds()
+
+            if logger:
+                logger.log_subprocess_end(returncode, duration)
+
+            # Stop heartbeat and wait for threads to finish reading
+            stop_event.set()
+            stdout_thread.join(timeout=2)
+            stderr_thread.join(timeout=2)
+            heartbeat_thread.join(timeout=2)
+
+            stdout_text = ''.join(stdout_lines)
+            stderr_text = ''.join(stderr_lines)
+
+            # Log full output to file
+            if log_file:
+                log_file.write(f"\nRETURN CODE: {returncode}\n")
+                log_file.write(f"DURATION: {duration:.2f}s\n")
+                log_file.write(f"\n--- STDOUT ({len(stdout_text)} chars) ---\n")
+                log_file.write(stdout_text)
+                log_file.write(f"\n--- STDERR ({len(stderr_text)} chars) ---\n")
+                log_file.write(stderr_text)
+                log_file.write(f"\n{'='*80}\n")
+                log_file.flush()
+
+            # Check for max turns error
+            max_turns_reached = False
+            combined_output = stdout_text + stderr_text
+            if 'max turns' in combined_output.lower() or 'reached max turns' in combined_output.lower():
+                max_turns_reached = True
+                if logger:
+                    logger.log_event("MAX_TURNS", "Max turns limit reached")
+
+            # Estimate token usage
+            input_tokens = estimate_tokens(prompt)
+            output_tokens = estimate_tokens(stdout_text)
+
+            return IterationResult(
+                success=returncode == 0,
+                output=stdout_text,
+                error=stderr_text if returncode != 0 else None,
+                max_turns_reached=max_turns_reached,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens
+            )
+
+        except subprocess.TimeoutExpired:
+            duration = (datetime.now() - execution_start).total_seconds()
+            if logger:
+                logger.log_timeout(timeout)
+
+            # Kill the process
+            process.kill()
+            process.wait()
+
+            # Stop heartbeat and get whatever output we have so far
+            stop_event.set()
+            stdout_thread.join(timeout=2)
+            stderr_thread.join(timeout=2)
+            heartbeat_thread.join(timeout=2)
+
+            stdout_text = ''.join(stdout_lines)
+            stderr_text = ''.join(stderr_lines)
+
+            error_msg = f'Iteration timed out after {timeout} seconds'
+            if log_file:
+                log_file.write(f"\n❌ TIMEOUT ERROR: {error_msg}\n")
+                log_file.write(f"DURATION: {duration:.2f}s\n")
+                log_file.write(f"\nPartial STDOUT ({len(stdout_text)} chars):\n{stdout_text}\n")
+                log_file.write(f"\nPartial STDERR ({len(stderr_text)} chars):\n{stderr_text}\n")
+                log_file.flush()
+
+            # Estimate token usage even for timeout
+            input_tokens = estimate_tokens(prompt)
+            output_tokens = estimate_tokens(stdout_text)
+
+            return IterationResult(
+                success=False,
+                output=stdout_text,
+                error=error_msg,
+                timeout_occurred=True,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens
+            )
+
     except Exception as e:
+        duration = (datetime.now() - execution_start).total_seconds()
         error_msg = f'Failed to run claude: {type(e).__name__}: {e}'
+
+        if logger:
+            logger.log_error("EXCEPTION", error_msg)
+
         if log_file:
             log_file.write(f"\n❌ EXCEPTION: {error_msg}\n")
+            log_file.write(f"DURATION: {duration:.2f}s\n")
             import traceback
             log_file.write(traceback.format_exc())
             log_file.flush()
+
+        # Estimate token usage even for exceptions
+        input_tokens = estimate_tokens(prompt)
+
         return IterationResult(
             success=False,
             output='',
-            error=error_msg
+            error=error_msg,
+            input_tokens=input_tokens,
+            output_tokens=0
         )
 
 
 def run_codex_iteration(prompt: str, timeout: int = 600, log_file: Optional[TextIO] = None) -> IterationResult:
-    """Run one iteration using Codex CLI."""
+    """Run one iteration using Codex CLI with detailed logging and streaming output."""
     cmd = [
         'codex', 'exec',
         '-s', 'danger-full-access',
@@ -240,6 +451,9 @@ def run_codex_iteration(prompt: str, timeout: int = 600, log_file: Optional[Text
     env = os.environ.copy()
     env['CLAUDE_CODE_YOLO'] = '1'
 
+    # Initialize detailed logger
+    logger = DetailedLogger(log_file) if log_file else None
+
     # Log command and environment to file
     if log_file:
         log_file.write(f"\n{'='*80}\n")
@@ -250,63 +464,162 @@ def run_codex_iteration(prompt: str, timeout: int = 600, log_file: Optional[Text
         log_file.write(f"{'='*80}\n")
         log_file.flush()
 
+    if logger:
+        logger.start_timing()
+        logger.log_subprocess_start(cmd, {'CLAUDE_CODE_YOLO': '1'})
+
+    execution_start = datetime.now()
+
     try:
-        result = subprocess.run(
+        # Use Popen for streaming output
+        process = subprocess.Popen(
             cmd,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout,
-            env=env
+            env=env,
+            bufsize=1  # Line buffered
         )
 
-        # Log full output to file
-        if log_file:
-            log_file.write(f"\nRETURN CODE: {result.returncode}\n")
-            log_file.write(f"\n--- STDOUT ({len(result.stdout)} chars) ---\n")
-            log_file.write(result.stdout)
-            log_file.write(f"\n--- STDERR ({len(result.stderr)} chars) ---\n")
-            log_file.write(result.stderr)
-            log_file.write(f"\n{'='*80}\n")
-            log_file.flush()
+        # Lists to collect output
+        stdout_lines = []
+        stderr_lines = []
 
-        # Check for max turns error
-        max_turns_reached = False
-        combined_output = result.stdout + result.stderr
-        if 'max turns' in combined_output.lower() or 'reached max turns' in combined_output.lower():
-            max_turns_reached = True
+        # Create stop event for heartbeat
+        stop_event = threading.Event()
 
-        return IterationResult(
-            success=result.returncode == 0,
-            output=result.stdout,
-            error=result.stderr if result.returncode != 0 else None,
-            max_turns_reached=max_turns_reached
+        # Start threads to read output
+        stdout_thread = threading.Thread(
+            target=stream_output_reader,
+            args=(process.stdout, stdout_lines, 'stdout', logger or DetailedLogger(open('/dev/null', 'w')))
         )
-    except subprocess.TimeoutExpired as e:
-        error_msg = f'Iteration timed out after {timeout} seconds'
-        if log_file:
-            log_file.write(f"\n❌ TIMEOUT ERROR: {error_msg}\n")
-            if e.stdout:
-                log_file.write(f"\nPartial STDOUT:\n{e.stdout}\n")
-            if e.stderr:
-                log_file.write(f"\nPartial STDERR:\n{e.stderr}\n")
-            log_file.flush()
-        return IterationResult(
-            success=False,
-            output=e.stdout.decode() if e.stdout else '',
-            error=error_msg,
-            timeout_occurred=True
+        stderr_thread = threading.Thread(
+            target=stream_output_reader,
+            args=(process.stderr, stderr_lines, 'stderr', logger or DetailedLogger(open('/dev/null', 'w')))
         )
+        heartbeat_thread = threading.Thread(
+            target=heartbeat_monitor,
+            args=(process, logger or DetailedLogger(open('/dev/null', 'w')), 30, stop_event)
+        )
+
+        stdout_thread.daemon = True
+        stderr_thread.daemon = True
+        heartbeat_thread.daemon = True
+        stdout_thread.start()
+        stderr_thread.start()
+        heartbeat_thread.start()
+
+        # Wait for process with timeout
+        try:
+            returncode = process.wait(timeout=timeout)
+            duration = (datetime.now() - execution_start).total_seconds()
+
+            if logger:
+                logger.log_subprocess_end(returncode, duration)
+
+            # Stop heartbeat and wait for threads to finish reading
+            stop_event.set()
+            stdout_thread.join(timeout=2)
+            stderr_thread.join(timeout=2)
+            heartbeat_thread.join(timeout=2)
+
+            stdout_text = ''.join(stdout_lines)
+            stderr_text = ''.join(stderr_lines)
+
+            # Log full output to file
+            if log_file:
+                log_file.write(f"\nRETURN CODE: {returncode}\n")
+                log_file.write(f"DURATION: {duration:.2f}s\n")
+                log_file.write(f"\n--- STDOUT ({len(stdout_text)} chars) ---\n")
+                log_file.write(stdout_text)
+                log_file.write(f"\n--- STDERR ({len(stderr_text)} chars) ---\n")
+                log_file.write(stderr_text)
+                log_file.write(f"\n{'='*80}\n")
+                log_file.flush()
+
+            # Check for max turns error
+            max_turns_reached = False
+            combined_output = stdout_text + stderr_text
+            if 'max turns' in combined_output.lower() or 'reached max turns' in combined_output.lower():
+                max_turns_reached = True
+                if logger:
+                    logger.log_event("MAX_TURNS", "Max turns limit reached")
+
+            # Estimate token usage
+            input_tokens = estimate_tokens(prompt)
+            output_tokens = estimate_tokens(stdout_text)
+
+            return IterationResult(
+                success=returncode == 0,
+                output=stdout_text,
+                error=stderr_text if returncode != 0 else None,
+                max_turns_reached=max_turns_reached,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens
+            )
+
+        except subprocess.TimeoutExpired:
+            duration = (datetime.now() - execution_start).total_seconds()
+            if logger:
+                logger.log_timeout(timeout)
+
+            # Kill the process
+            process.kill()
+            process.wait()
+
+            # Stop heartbeat and get whatever output we have so far
+            stop_event.set()
+            stdout_thread.join(timeout=2)
+            stderr_thread.join(timeout=2)
+            heartbeat_thread.join(timeout=2)
+
+            stdout_text = ''.join(stdout_lines)
+            stderr_text = ''.join(stderr_lines)
+
+            error_msg = f'Iteration timed out after {timeout} seconds'
+            if log_file:
+                log_file.write(f"\n❌ TIMEOUT ERROR: {error_msg}\n")
+                log_file.write(f"DURATION: {duration:.2f}s\n")
+                log_file.write(f"\nPartial STDOUT ({len(stdout_text)} chars):\n{stdout_text}\n")
+                log_file.write(f"\nPartial STDERR ({len(stderr_text)} chars):\n{stderr_text}\n")
+                log_file.flush()
+
+            # Estimate token usage even for timeout
+            input_tokens = estimate_tokens(prompt)
+            output_tokens = estimate_tokens(stdout_text)
+
+            return IterationResult(
+                success=False,
+                output=stdout_text,
+                error=error_msg,
+                timeout_occurred=True,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens
+            )
+
     except Exception as e:
+        duration = (datetime.now() - execution_start).total_seconds()
         error_msg = f'Failed to run codex: {type(e).__name__}: {e}'
+
+        if logger:
+            logger.log_error("EXCEPTION", error_msg)
+
         if log_file:
             log_file.write(f"\n❌ EXCEPTION: {error_msg}\n")
+            log_file.write(f"DURATION: {duration:.2f}s\n")
             import traceback
             log_file.write(traceback.format_exc())
             log_file.flush()
+
+        # Estimate token usage even for exceptions
+        input_tokens = estimate_tokens(prompt)
+
         return IterationResult(
             success=False,
             output='',
-            error=error_msg
+            error=error_msg,
+            input_tokens=input_tokens,
+            output_tokens=0
         )
 
 
@@ -467,8 +780,16 @@ Examples:
         print(f"Human-in-the-loop: {args.human_in_the_loop}")
         print("="*60)
 
+        # Calculate initial context window usage
+        initial_prompt = create_wrapped_prompt(args.prompt, 1, outer_prompt_template, None)
+        initial_tokens = estimate_tokens(initial_prompt)
+        print(f"\n📊 Initial context window usage: {format_context_stats(initial_tokens)}")
+        print("="*60)
+
         start_time = datetime.now()
         previous_result: Optional[IterationResult] = None
+        cumulative_input_tokens = 0
+        cumulative_output_tokens = 0
 
         for iteration in range(1, args.max_iterations + 1):
             print(f"\n🔄 Iteration {iteration}/{args.max_iterations}")
@@ -500,6 +821,16 @@ Examples:
                 result = run_codex_iteration(wrapped_prompt, args.timeout, log_file)
 
             result.iteration_num = iteration
+
+            # Track cumulative tokens
+            cumulative_input_tokens += result.input_tokens
+            cumulative_output_tokens += result.output_tokens
+
+            # Display iteration stats
+            print(f"\n📊 Iteration {iteration} tokens:")
+            print(f"   Input:  {result.input_tokens:,} tokens")
+            print(f"   Output: {result.output_tokens:,} tokens")
+            print(f"   Total:  {result.input_tokens + result.output_tokens:,} tokens")
 
             # Store result for next iteration's feedback
             previous_result = result
@@ -581,6 +912,13 @@ Examples:
         elapsed = datetime.now() - start_time
         print(f"\n⏱️  Total time: {elapsed}")
         print(f"🔢 Iterations completed: {iteration}")
+
+        # Display cumulative context window usage
+        total_tokens = cumulative_input_tokens + cumulative_output_tokens
+        print(f"\n📊 Final context window usage:")
+        print(f"   Input tokens:  {format_context_stats(cumulative_input_tokens)}")
+        print(f"   Output tokens: {format_context_stats(cumulative_output_tokens)}")
+        print(f"   Total tokens:  {format_context_stats(total_tokens)}")
 
         # Show final git status
         print("\n📊 Final git status:")
