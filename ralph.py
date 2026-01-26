@@ -7,12 +7,13 @@ Progress persists in files and git, not context.
 """
 
 import argparse
+import json
 import os
 import subprocess
 import sys
 import time
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict, field
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, TextIO
@@ -98,12 +99,15 @@ class DetailedLogger:
         self.log_event("TIMEOUT", f"Subprocess exceeded timeout of {timeout_seconds}s")
 
 
-def stream_output_reader(pipe, output_list: list, stream_name: str, logger: DetailedLogger):
-    """Read from a pipe and append to output_list, logging chunks."""
+def stream_output_reader(pipe, output_list: list, stream_name: str, logger: DetailedLogger, timestamped_list: list = None):
+    """Read from a pipe and append to output_list, logging chunks with timestamps."""
     try:
         for line in iter(pipe.readline, ''):
             if line:
+                timestamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]
                 output_list.append(line)
+                if timestamped_list is not None:
+                    timestamped_list.append((timestamp, line))
                 logger.log_output_chunk(stream_name, line, len(line))
     except Exception as e:
         logger.log_error("STREAM_READ_ERROR", f"Error reading {stream_name}: {e}")
@@ -137,6 +141,7 @@ class StreamingSubprocess:
         self.process = None
         self.stdout_lines = []
         self.stderr_lines = []
+        self.timestamped_stdout = []  # List of (timestamp, line) tuples
         self.stop_event = threading.Event()
         self.threads = []
 
@@ -154,7 +159,7 @@ class StreamingSubprocess:
         # Start reader and heartbeat threads
         stdout_thread = threading.Thread(
             target=stream_output_reader,
-            args=(self.process.stdout, self.stdout_lines, 'stdout', self.logger)
+            args=(self.process.stdout, self.stdout_lines, 'stdout', self.logger, self.timestamped_stdout)
         )
         stderr_thread = threading.Thread(
             target=stream_output_reader,
@@ -179,12 +184,12 @@ class StreamingSubprocess:
             t.join(timeout=2)
         return False
 
-    def wait_with_timeout(self) -> tuple[int, str, str]:
+    def wait_with_timeout(self) -> tuple[int, str, str, list]:
         """
         Wait for process to complete with timeout.
 
         Returns:
-            Tuple of (returncode, stdout_text, stderr_text)
+            Tuple of (returncode, stdout_text, stderr_text, timestamped_stdout)
 
         Raises:
             subprocess.TimeoutExpired: If timeout is exceeded
@@ -192,20 +197,20 @@ class StreamingSubprocess:
         returncode = self.process.wait(timeout=self.timeout)
         stdout_text = ''.join(self.stdout_lines)
         stderr_text = ''.join(self.stderr_lines)
-        return returncode, stdout_text, stderr_text
+        return returncode, stdout_text, stderr_text, self.timestamped_stdout
 
-    def kill(self) -> tuple[str, str]:
+    def kill(self) -> tuple[str, str, list]:
         """
         Kill the process and return captured output.
 
         Returns:
-            Tuple of (stdout_text, stderr_text)
+            Tuple of (stdout_text, stderr_text, timestamped_stdout)
         """
         self.process.kill()
         self.process.wait()
         stdout_text = ''.join(self.stdout_lines)
         stderr_text = ''.join(self.stderr_lines)
-        return stdout_text, stderr_text
+        return stdout_text, stderr_text, self.timestamped_stdout
 
 
 @dataclass
@@ -220,6 +225,25 @@ class IterationResult:
     feedback_summary: Optional[str] = None
     input_tokens: int = 0
     output_tokens: int = 0
+    duration_seconds: float = 0.0
+    timestamp: str = ""
+    timestamped_lines: Optional[list] = None  # List of (timestamp, line) tuples
+
+    def to_dict(self):
+        """Convert to dictionary for JSON serialization."""
+        return {
+            'success': self.success,
+            'iteration_num': self.iteration_num,
+            'max_turns_reached': self.max_turns_reached,
+            'timeout_occurred': self.timeout_occurred,
+            'input_tokens': self.input_tokens,
+            'output_tokens': self.output_tokens,
+            'duration_seconds': self.duration_seconds,
+            'timestamp': self.timestamp,
+            'has_error': self.error is not None,
+            'output_length': len(self.output),
+            'error_length': len(self.error) if self.error else 0
+        }
 
 
 def _run_cli_iteration_impl(
@@ -264,12 +288,13 @@ def _run_cli_iteration_impl(
         logger.log_subprocess_start(cmd, {'CLAUDE_CODE_YOLO': '1'})
 
     execution_start = datetime.now()
+    timestamp_str = execution_start.strftime('%Y-%m-%d %H:%M:%S')
 
     try:
         # Use context manager for subprocess with streaming output
         with StreamingSubprocess(cmd, env, logger, timeout) as proc:
             try:
-                returncode, stdout_text, stderr_text = proc.wait_with_timeout()
+                returncode, stdout_text, stderr_text, timestamped_stdout = proc.wait_with_timeout()
                 duration = (datetime.now() - execution_start).total_seconds()
 
                 if logger:
@@ -304,7 +329,10 @@ def _run_cli_iteration_impl(
                     error=stderr_text if returncode != 0 else None,
                     max_turns_reached=max_turns_reached,
                     input_tokens=input_tokens,
-                    output_tokens=output_tokens
+                    output_tokens=output_tokens,
+                    duration_seconds=duration,
+                    timestamp=timestamp_str,
+                    timestamped_lines=timestamped_stdout
                 )
 
             except subprocess.TimeoutExpired:
@@ -313,7 +341,7 @@ def _run_cli_iteration_impl(
                     logger.log_timeout(timeout)
 
                 # Kill the process and get partial output
-                stdout_text, stderr_text = proc.kill()
+                stdout_text, stderr_text, timestamped_stdout = proc.kill()
 
                 error_msg = f'Iteration timed out after {timeout} seconds'
                 if log_file:
@@ -333,7 +361,10 @@ def _run_cli_iteration_impl(
                     error=error_msg,
                     timeout_occurred=True,
                     input_tokens=input_tokens,
-                    output_tokens=output_tokens
+                    output_tokens=output_tokens,
+                    duration_seconds=duration,
+                    timestamp=timestamp_str,
+                    timestamped_lines=timestamped_stdout
                 )
 
     except Exception as e:
@@ -358,7 +389,10 @@ def _run_cli_iteration_impl(
             output='',
             error=error_msg,
             input_tokens=input_tokens,
-            output_tokens=0
+            output_tokens=0,
+            duration_seconds=duration,
+            timestamp=timestamp_str,
+            timestamped_lines=[]
         )
 
 
@@ -370,6 +404,223 @@ def estimate_tokens(text: str) -> int:
     For more accurate counting, would need tiktoken or anthropic SDK.
     """
     return len(text) // 4
+
+
+def create_run_directory() -> Path:
+    """Create a timestamped directory for this Ralph run."""
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    run_dir = Path(f'/tmp/ralph_{timestamp}')
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
+def create_iteration_directory(run_dir: Path, iteration_num: int) -> Path:
+    """Create a directory for a specific iteration."""
+    iter_dir = run_dir / f'iteration_{iteration_num:02d}'
+    iter_dir.mkdir(parents=True, exist_ok=True)
+    return iter_dir
+
+
+def truncate_with_indicator(text: str, max_length: int = 1024) -> str:
+    """Truncate text to max_length, adding indicator if truncated."""
+    if len(text) <= max_length:
+        return text
+    return text[:max_length] + f"\n... [truncated, {len(text) - max_length} more chars]"
+
+
+def parse_tool_use_from_output(output: str) -> list:
+    """
+    Parse tool use and results from Claude CLI output.
+    Returns list of dicts with tool information including errors and return codes.
+    """
+    import re
+
+    tools = []
+    lines = output.split('\n')
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+
+        # Look for tool invocation patterns - Claude CLI typically shows these
+        # Pattern: "Using <tool_name>:" or similar
+        if 'invoke name=' in line or '<invoke' in line:
+            tool_info = {
+                'type': 'tool_use',
+                'name': '',
+                'input': '',
+                'result': '',
+                'has_error': False,
+                'return_code': None,
+                'error_message': ''
+            }
+
+            # Try to extract tool name
+            name_match = re.search(r'invoke name="([^"]+)"', line)
+            if name_match:
+                tool_info['name'] = name_match.group(1)
+
+            # Collect input (next few lines until we see result or new tool)
+            j = i + 1
+            input_lines = []
+            while j < len(lines) and j < i + 50:  # Look ahead max 50 lines
+                if '<invoke' in lines[j] or 'function_results' in lines[j]:
+                    break
+                if lines[j].strip():
+                    input_lines.append(lines[j])
+                j += 1
+
+            tool_info['input'] = truncate_with_indicator('\n'.join(input_lines), 1024)
+
+            # Look for results
+            k = j
+            while k < len(lines) and k < i + 100:  # Look ahead max 100 lines
+                if 'function_results' in lines[k] or '<function_results>' in lines[k]:
+                    result_lines = []
+                    k += 1
+                    while k < len(lines) and '</function_results>' not in lines[k] and k < i + 100:
+                        result_lines.append(lines[k])
+                        k += 1
+
+                    result_text = '\n'.join(result_lines)
+
+                    # Check for errors in the result
+                    if '<error>' in result_text or 'Error:' in result_text or 'error' in result_text.lower():
+                        tool_info['has_error'] = True
+
+                        # Try to extract error message
+                        error_match = re.search(r'<error>(.*?)</error>', result_text, re.DOTALL)
+                        if error_match:
+                            tool_info['error_message'] = truncate_with_indicator(error_match.group(1).strip(), 512)
+                        else:
+                            # Look for other error patterns
+                            for line_text in result_lines:
+                                if 'error' in line_text.lower():
+                                    tool_info['error_message'] = truncate_with_indicator(line_text.strip(), 512)
+                                    break
+
+                    # For Bash tool, look for "Exit code" or return code
+                    if tool_info['name'] == 'Bash' or 'exit code' in result_text.lower():
+                        exit_match = re.search(r'Exit code[:\s]+(\d+)', result_text, re.IGNORECASE)
+                        if exit_match:
+                            tool_info['return_code'] = int(exit_match.group(1))
+                            if tool_info['return_code'] != 0:
+                                tool_info['has_error'] = True
+
+                    tool_info['result'] = truncate_with_indicator(result_text, 1024)
+                    break
+                k += 1
+
+            if tool_info['name']:
+                tools.append(tool_info)
+            i = k
+        else:
+            i += 1
+
+    return tools
+
+
+def write_iteration_logs(iter_dir: Path, result: IterationResult, prompt: str, command: list):
+    """
+    Write comprehensive logs for an iteration to its directory.
+
+    Creates multiple files:
+    - log.txt: Main log with formatted output resembling Claude CLI
+    - metadata.json: Structured metadata about the iteration
+    - prompt.txt: The wrapped prompt sent to Claude
+    - output.txt: Raw output from Claude
+    - stderr.txt: Error output if any
+    """
+    # Write prompt
+    (iter_dir / 'prompt.txt').write_text(prompt, encoding='utf-8')
+
+    # Write raw output
+    (iter_dir / 'output.txt').write_text(result.output, encoding='utf-8')
+
+    # Write stderr if present
+    if result.error:
+        (iter_dir / 'stderr.txt').write_text(result.error, encoding='utf-8')
+
+    # Parse tool use from output
+    tool_uses = parse_tool_use_from_output(result.output)
+
+    # Write metadata as JSON
+    metadata = {
+        **result.to_dict(),
+        'command': ' '.join(command),
+        'prompt_length': len(prompt),
+        'output_length': len(result.output),
+        'tool_uses_count': len(tool_uses)
+    }
+    (iter_dir / 'metadata.json').write_text(
+        json.dumps(metadata, indent=2),
+        encoding='utf-8'
+    )
+
+    # Write main log file with formatted output
+    with open(iter_dir / 'log.txt', 'w', encoding='utf-8') as f:
+        # Header
+        f.write("="*80 + "\n")
+        f.write(f"Ralph Loop - Iteration {result.iteration_num}\n")
+        f.write(f"Timestamp: {result.timestamp}\n")
+        f.write(f"Duration: {result.duration_seconds:.2f}s\n")
+        f.write("="*80 + "\n\n")
+
+        # Command info
+        f.write("Command:\n")
+        f.write(f"  {' '.join(command)}\n\n")
+
+        # Status
+        status_icon = "✅" if result.success else "❌"
+        f.write(f"Status: {status_icon} {'Success' if result.success else 'Failed'}\n")
+        if result.max_turns_reached:
+            f.write("  ⚠️  Max turns limit reached\n")
+        if result.timeout_occurred:
+            f.write("  ⚠️  Timeout occurred\n")
+        f.write("\n")
+
+        # Token usage
+        f.write("Token Usage (estimated):\n")
+        f.write(f"  Input:  {result.input_tokens:,} tokens\n")
+        f.write(f"  Output: {result.output_tokens:,} tokens\n")
+        f.write(f"  Total:  {result.input_tokens + result.output_tokens:,} tokens\n")
+        f.write("\n")
+
+        # Tool summary if any
+        if tool_uses:
+            f.write(f"Tools Used: {len(tool_uses)}\n")
+            for i, tool in enumerate(tool_uses, 1):
+                f.write(f"  {i}. {tool['name']}\n")
+            f.write("\n")
+
+        # Separator
+        f.write("="*80 + "\n")
+        f.write("Claude Output (with timestamps)\n")
+        f.write("="*80 + "\n\n")
+
+        # Main output with timestamps if available
+        if result.timestamped_lines:
+            for timestamp, line in result.timestamped_lines:
+                # Remove trailing newline from line since we'll add it back
+                line_stripped = line.rstrip('\n')
+                f.write(f"[{timestamp}] {line_stripped}\n")
+        else:
+            # Fallback to plain output
+            f.write(result.output)
+
+        # Errors if any
+        if result.error:
+            f.write("\n\n")
+            f.write("="*80 + "\n")
+            f.write("Errors\n")
+            f.write("="*80 + "\n\n")
+            f.write(result.error)
+
+        # Footer
+        f.write("\n\n")
+        f.write("="*80 + "\n")
+        f.write(f"End of Iteration {result.iteration_num}\n")
+        f.write("="*80 + "\n")
 
 
 def extract_iteration_feedback(result: IterationResult) -> str:
@@ -606,10 +857,12 @@ Examples:
     elif not args.prompt:
         parser.error("Either provide a prompt argument or use --prompt-file/-f")
 
-    # Set up log file
+    # Create run directory for all logs
+    run_dir = create_run_directory()
+
+    # Set up main log file (consolidated across all iterations)
     if args.log_file is None:
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        args.log_file = f'/tmp/ralph_{timestamp}.log'
+        args.log_file = str(run_dir / 'ralph.log')
 
     # Create log file and set up tee logger
     log_file = open(args.log_file, 'w', encoding='utf-8')
@@ -628,7 +881,8 @@ Examples:
             return 1
 
         print("🚀 Ralph Loop Starting")
-        print(f"📝 Logging to: {args.log_file}")
+        print(f"📁 Run directory: {run_dir}")
+        print(f"📝 Main log: {args.log_file}")
         print(f"Task: {args.prompt}")
         print(f"Max iterations: {args.max_iterations}")
         print(f"Max turns per iteration: {args.max_turns}")
@@ -676,10 +930,20 @@ Examples:
             # Run iteration
             if args.cli_type == 'claude':
                 result = run_claude_iteration(wrapped_prompt, args.model, args.max_turns, args.timeout, log_file)
+                cmd_used = [
+                    'claude', '--print', '--dangerously-skip-permissions',
+                    '--max-turns', str(args.max_turns), '--model', args.model, '-p', '[prompt]'
+                ]
             else:
                 result = run_codex_iteration(wrapped_prompt, args.timeout, log_file)
+                cmd_used = ['codex', 'exec', '-s', 'danger-full-access', '[prompt]']
 
             result.iteration_num = iteration
+
+            # Create iteration directory and write logs
+            iter_dir = create_iteration_directory(run_dir, iteration)
+            write_iteration_logs(iter_dir, result, wrapped_prompt, cmd_used)
+            print(f"📁 Iteration logs: {iter_dir}")
 
             # Track cumulative tokens
             cumulative_input_tokens += result.input_tokens
@@ -779,6 +1043,32 @@ Examples:
         print(f"   Output: {cumulative_output_tokens:,} tokens")
         print(f"   Total:  {total_tokens:,} tokens")
 
+        # Write run summary to run directory
+        summary_file = run_dir / 'summary.txt'
+        with open(summary_file, 'w', encoding='utf-8') as f:
+            f.write("="*80 + "\n")
+            f.write("Ralph Loop Run Summary\n")
+            f.write("="*80 + "\n\n")
+            f.write(f"Task: {args.prompt}\n")
+            f.write(f"Start time: {start_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"End time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Total elapsed: {elapsed}\n")
+            f.write(f"Iterations completed: {iteration}\n")
+            f.write(f"Max iterations: {args.max_iterations}\n\n")
+            f.write(f"Token usage (estimated):\n")
+            f.write(f"  Input:  {cumulative_input_tokens:,} tokens\n")
+            f.write(f"  Output: {cumulative_output_tokens:,} tokens\n")
+            f.write(f"  Total:  {total_tokens:,} tokens\n\n")
+            f.write(f"Configuration:\n")
+            f.write(f"  CLI type: {args.cli_type}\n")
+            if args.cli_type == 'claude':
+                f.write(f"  Model: {args.model}\n")
+            f.write(f"  Max turns: {args.max_turns}\n")
+            f.write(f"  Timeout: {args.timeout}s\n\n")
+            f.write(f"Run directory: {run_dir}\n")
+
+        print(f"\n📄 Run summary: {summary_file}")
+
         # Show final git status
         print("\n📊 Final git status:")
         subprocess.run(['git', 'status', '--short'])
@@ -796,7 +1086,8 @@ Examples:
         # Always clean up logger and close log file
         logger.restore()
         log_file.close()
-        print(f"\n📄 Full log saved to: {args.log_file}", file=sys.stdout)
+        print(f"\n📁 All logs saved to: {run_dir}", file=sys.stdout)
+        print(f"📄 Main log: {args.log_file}", file=sys.stdout)
 
 
 if __name__ == '__main__':
