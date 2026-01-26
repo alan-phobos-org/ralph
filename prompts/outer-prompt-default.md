@@ -102,7 +102,7 @@ WORK ON EXACTLY ONE SUBTASK FROM THE LIST, THEN COMMIT AND STOP!
 10. Update progress.md inline in the task section:
    - Change status to [COMPLETED YYYY-MM-DD HH:MM]
    - Add progress notes directly under the task (e.g., "Progress: Implemented X, tested Y")
-11. Commit all work and updated progress.md together
+11. Commit all files you touched and updated progress.md together (ignore other changed files in the workspace)
 12. **STOP IMMEDIATELY** - do not continue to next task
 
 ═══════════════════════════════════════════════════════════════
