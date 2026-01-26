@@ -372,21 +372,6 @@ def estimate_tokens(text: str) -> int:
     return len(text) // 4
 
 
-def format_context_stats(tokens: int, context_window: int = 200000) -> str:
-    """
-    Format token count with percentage of context window.
-
-    Args:
-        tokens: Number of tokens
-        context_window: Total context window size (default: 200k for Claude models)
-
-    Returns:
-        Formatted string with token count and percentage
-    """
-    percentage = (tokens / context_window) * 100
-    return f"{tokens:,} tokens ({percentage:.1f}% of {context_window:,})"
-
-
 def extract_iteration_feedback(result: IterationResult) -> str:
     """Extract feedback from iteration result to pass to next iteration."""
     feedback_parts = []
@@ -654,10 +639,10 @@ Examples:
         print(f"Human-in-the-loop: {args.human_in_the_loop}")
         print("="*60)
 
-        # Calculate initial context window usage
+        # Calculate initial token count
         initial_prompt = create_wrapped_prompt(args.prompt, 1, outer_prompt_template, None)
         initial_tokens = estimate_tokens(initial_prompt)
-        print(f"\n📊 Initial context window usage: {format_context_stats(initial_tokens)}")
+        print(f"\n📊 Initial prompt size: {initial_tokens:,} tokens (estimated)")
         print("="*60)
 
         start_time = datetime.now()
@@ -787,12 +772,12 @@ Examples:
         print(f"\n⏱️  Total time: {elapsed}")
         print(f"🔢 Iterations completed: {iteration}")
 
-        # Display cumulative context window usage
+        # Display cumulative token usage
         total_tokens = cumulative_input_tokens + cumulative_output_tokens
-        print(f"\n📊 Final context window usage:")
-        print(f"   Input tokens:  {format_context_stats(cumulative_input_tokens)}")
-        print(f"   Output tokens: {format_context_stats(cumulative_output_tokens)}")
-        print(f"   Total tokens:  {format_context_stats(total_tokens)}")
+        print(f"\n📊 Total token usage (estimated):")
+        print(f"   Input:  {cumulative_input_tokens:,} tokens")
+        print(f"   Output: {cumulative_output_tokens:,} tokens")
+        print(f"   Total:  {total_tokens:,} tokens")
 
         # Show final git status
         print("\n📊 Final git status:")
