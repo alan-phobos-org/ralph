@@ -1,95 +1,71 @@
 # Ralph Loop Logging
 
-Ralph Loop creates detailed, structured logs for each run to help you understand and debug agent behavior.
+Ralph Loop creates a single, comprehensive log file for each run to help you understand and debug agent behavior.
 
-## Directory Structure
+## Log File Structure
 
-Each Ralph run creates a timestamped directory in `/tmp/`:
+Each Ralph run creates a single timestamped log file in `/tmp/`:
 
 ```
-/tmp/ralph_20260126_143022/
-├── ralph.log                    # Consolidated log across all iterations
-├── summary.txt                  # Run summary with stats and configuration
-├── iteration_01/
-│   ├── log.txt                  # Formatted log resembling Claude CLI output
-│   ├── metadata.json            # Structured data (tokens, duration, status)
-│   ├── prompt.txt               # Full wrapped prompt sent to Claude
-│   ├── output.txt               # Raw output from Claude
-│   └── stderr.txt               # Error output (if any)
-├── iteration_02/
-│   ├── log.txt
-│   ├── metadata.json
-│   ├── prompt.txt
-│   ├── output.txt
-│   └── stderr.txt
-└── iteration_03/
-    └── ...
+/tmp/ralph_myproject_20260126_143022_iteration.log
 ```
 
-## File Descriptions
+The filename includes:
+- `ralph_` prefix
+- Work directory basename (e.g., `myproject`)
+- Timestamp (`YYYYMMDD_HHMMSS`)
+- `_iteration.log` suffix
 
-### Run-Level Files
+## Log File Contents
 
-**`ralph.log`** - Main consolidated log file
-- Contains all console output
-- Includes full details of each iteration
-- Useful for viewing the complete run in one file
+The single log file contains everything from the entire run in chronological order:
 
-**`summary.txt`** - High-level summary
+### Initial Configuration Section
 - Task description
-- Start/end times and total duration
-- Number of iterations completed
-- Token usage statistics
-- Configuration settings
+- Start time
+- Configuration settings (max iterations, max turns, timeout, CLI type, model)
+- **Initial wrapped prompt** (shown once at the start)
 
-### Iteration-Level Files
-
-Each `iteration_XX/` directory contains:
-
-**`log.txt`** - Primary iteration log
-- Header with timestamp, duration, status
+### Per-Iteration Sections
+Each iteration includes:
+- Header with iteration number, timestamp, and duration
 - Command executed
-- Token usage statistics and tool summary
+- Status (success/failure, max turns, timeout indicators)
+- Token usage statistics (input, output, total)
+- Tool summary (count and names of tools used)
 - **Full Claude output with line-by-line timestamps**
-- Detailed tool use section showing inputs (first 1024 chars) and outputs (first 1024 chars)
-- Error messages if any
-- Formatted to resemble Claude CLI interactive output
+- Error output if any
 
-**`metadata.json`** - Structured metadata
-```json
-{
-  "success": true,
-  "iteration_num": 1,
-  "max_turns_reached": false,
-  "timeout_occurred": false,
-  "input_tokens": 5234,
-  "output_tokens": 1823,
-  "duration_seconds": 45.32,
-  "timestamp": "2026-01-26 14:30:22",
-  "has_error": false,
-  "output_length": 12453,
-  "command": "claude --print --dangerously-skip-permissions ...",
-  "tool_uses_count": 3
-}
-```
-
-**`prompt.txt`** - Full prompt
-- Contains the complete wrapped prompt sent to Claude
-- Includes outer prompt template, user task, and feedback from previous iteration
-
-**`output.txt`** - Raw output
-- Unformatted stdout from Claude CLI
-- Useful for programmatic parsing or diffing
-
-**`stderr.txt`** - Error output (if present)
-- Only created if there were errors
-- Contains stderr from Claude CLI
+### Run Summary Section
+At the end of the file:
+- Task description
+- Start/end times and total elapsed time
+- Number of iterations completed
+- Cumulative token usage across all iterations
+- Configuration summary
 
 ## Enhanced Log Format
 
-The `log.txt` file uses an enhanced format with detailed timestamps and tool information:
+The log file uses an enhanced format with detailed timestamps and tool information. The wrapped prompt is shown **only once** at the start of the file, not before each iteration:
 
 ```
+================================================================================
+Ralph Loop - Initial Configuration
+================================================================================
+
+Task: Fix all type errors in the codebase
+Start time: 2026-01-26 14:30:00
+Max iterations: 10
+Max turns per iteration: 50
+Timeout per iteration: 600 seconds
+CLI: claude
+Model: opus
+
+--- INITIAL WRAPPED PROMPT ---
+[Full wrapped prompt shown here once]
+--- END INITIAL WRAPPED PROMPT ---
+
+
 ================================================================================
 Ralph Loop - Iteration 1
 Timestamp: 2026-01-26 14:30:22
@@ -139,6 +115,30 @@ Claude Output (with timestamps)
 ================================================================================
 End of Iteration 1
 ================================================================================
+
+[Additional iterations follow...]
+
+================================================================================
+Ralph Loop Run Summary
+================================================================================
+
+Task: Fix all type errors in the codebase
+Start time: 2026-01-26 14:30:00
+End time: 2026-01-26 14:45:30
+Total elapsed: 0:15:30
+Iterations completed: 3
+Max iterations: 10
+
+Token usage (estimated):
+  Input:  15,234 tokens
+  Output: 8,432 tokens
+  Total:  23,666 tokens
+
+Configuration:
+  CLI type: claude
+  Model: opus
+  Max turns: 50
+  Timeout: 600s
 ```
 
 ### Key Features
@@ -208,43 +208,58 @@ Example of a failed tool:
 
 ## Usage Tips
 
+### Viewing the Log File
+
+```bash
+# View the entire log file
+less /tmp/ralph_myproject_20260126_143022_iteration.log
+
+# View just the initial configuration and prompt
+head -100 /tmp/ralph_myproject_20260126_143022_iteration.log
+
+# View the summary at the end
+tail -50 /tmp/ralph_myproject_20260126_143022_iteration.log
+
+# Search for a specific iteration
+grep -A 30 "Iteration 3" /tmp/ralph_myproject_20260126_143022_iteration.log
+```
+
 ### Debugging a Failed Iteration
 
-1. Check `iteration_XX/log.txt` for the formatted output
-2. Look at `metadata.json` for quick stats (timeout? max turns?)
-3. Review `stderr.txt` if it exists for error messages
-4. Compare `prompt.txt` to see what was actually sent
+1. Search for the iteration number in the log file
+2. Look for "Status: ❌ Failed" lines
+3. Check for "Max turns limit reached" or "Timeout occurred" warnings
+4. Review the error section for that iteration
+5. Examine the timestamped output to see where it failed
 
 ### Understanding Agent Behavior
 
-1. Read through `log.txt` to see Claude's thinking and tool use
+1. Read through the log file sequentially to see the full story
 2. Look for patterns in tool usage across iterations
 3. Check if timeouts or max turns are hit repeatedly
-4. Review feedback passed between iterations
+4. The initial prompt is shown once at the top for reference
 
 ### Performance Analysis
 
-1. Check `metadata.json` files for duration and token counts
-2. Look at `summary.txt` for overall statistics
+1. Look at each iteration's duration and token counts
+2. Check the summary section at the end for overall statistics
 3. Compare iteration durations to identify slow operations
-4. Review token usage to estimate costs
+4. Review cumulative token usage to estimate costs
 
-### Comparing Iterations
+### Searching and Filtering
 
 ```bash
-# Compare prompts across iterations
-diff /tmp/ralph_TIMESTAMP/iteration_01/prompt.txt \
-     /tmp/ralph_TIMESTAMP/iteration_02/prompt.txt
+# Find all errors
+grep -n "Status: ❌" /tmp/ralph_*.log
 
-# Compare outputs
-diff /tmp/ralph_TIMESTAMP/iteration_01/output.txt \
-     /tmp/ralph_TIMESTAMP/iteration_02/output.txt
+# Extract all iteration headers
+grep -n "Ralph Loop - Iteration" /tmp/ralph_*.log
 
-# View metadata for all iterations
-jq '.' /tmp/ralph_TIMESTAMP/iteration_*/metadata.json
+# View all tool summaries
+grep -A 5 "Tools Used:" /tmp/ralph_*.log
 
-# Count tool uses per iteration
-jq '.tool_uses_count' /tmp/ralph_TIMESTAMP/iteration_*/metadata.json
+# Find specific tool uses
+grep -B 2 -A 2 "invoke name=\"Edit\"" /tmp/ralph_*.log
 ```
 
 ### Analyzing Tool Performance
@@ -252,25 +267,24 @@ jq '.tool_uses_count' /tmp/ralph_TIMESTAMP/iteration_*/metadata.json
 The timestamped output lets you measure tool execution times:
 
 ```bash
-# Extract timestamps from log.txt to see tool latency
-grep -A 50 "invoke name=" /tmp/ralph_TIMESTAMP/iteration_01/log.txt | grep "^\[" | head -20
+# Find tool invocations and their timestamps
+grep "invoke name=" /tmp/ralph_*.log
 
-# View all tool uses across iterations
-grep -h "Tool #" /tmp/ralph_TIMESTAMP/iteration_*/log.txt
+# Calculate time between invocation and result
+# Look for the timestamp on the <invoke> line and the <function_results> line
+grep -A 20 "invoke name=" /tmp/ralph_*.log | grep "^\["
 ```
-
-You can calculate time between tool invocation and result:
-- Find the timestamp when `<invoke>` appears
-- Find the timestamp when `<function_results>` appears
-- The difference shows how long the tool took to execute
 
 ## Log Rotation
 
-Ralph does not automatically clean up old log directories. You may want to periodically remove old logs:
+Ralph does not automatically clean up old log files. You may want to periodically remove old logs:
 
 ```bash
 # Remove logs older than 7 days
-find /tmp -name "ralph_*" -type d -mtime +7 -exec rm -rf {} +
+find /tmp -name "ralph_*_iteration.log" -type f -mtime +7 -delete
+
+# List all Ralph logs sorted by date
+ls -lht /tmp/ralph_*_iteration.log
 ```
 
 ## Custom Log Locations
@@ -281,4 +295,4 @@ You can specify a custom log file location:
 ./ralph.py "task" --log-file /path/to/custom.log
 ```
 
-This will create the run directory at `/path/to/custom_[timestamp]/` instead of in `/tmp/`.
+This will create the log file at the specified path instead of the default `/tmp/` location.

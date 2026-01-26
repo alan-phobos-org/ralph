@@ -7,13 +7,12 @@ Progress persists in files and git, not context.
 """
 
 import argparse
-import json
 import os
 import subprocess
 import sys
 import time
 import threading
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, TextIO
@@ -99,16 +98,106 @@ class DetailedLogger:
         self.log_event("TIMEOUT", f"Subprocess exceeded timeout of {timeout_seconds}s")
 
 
-def stream_output_reader(pipe, output_list: list, stream_name: str, logger: DetailedLogger, timestamped_list: list = None):
-    """Read from a pipe and append to output_list, logging chunks with timestamps."""
+def stream_output_reader(pipe, output_list: list, stream_name: str, logger: DetailedLogger, timestamped_list: list = None, compaction_event: threading.Event = None, log_file: TextIO = None):
+    """Read from a pipe and append to output_list, logging chunks with timestamps and streaming to log file."""
+    import json
+
+    # Patterns that indicate Claude is about to compact the session
+    compaction_patterns = [
+        'conversation has been automatically summarized',
+        'conversation has unlimited context through automatic summarization',
+        'the conversation has been compacted',
+        'compacting the conversation',
+        'summarizing previous messages',
+        'context window is nearly full'
+    ]
+
     try:
-        for line in iter(pipe.readline, ''):
-            if line:
-                timestamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]
-                output_list.append(line)
-                if timestamped_list is not None:
-                    timestamped_list.append((timestamp, line))
-                logger.log_output_chunk(stream_name, line, len(line))
+        # Use explicit readline() to avoid Python's iterator buffering
+        while True:
+            line = pipe.readline()
+            if not line:
+                break
+
+            timestamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+            output_list.append(line)
+            if timestamped_list is not None:
+                timestamped_list.append((timestamp, line))
+            logger.log_output_chunk(stream_name, line, len(line))
+
+            # Stream to log file in real-time (only for stdout)
+            if log_file is not None and stream_name == 'stdout':
+                line_stripped = line.rstrip('\n')
+
+                # Try to parse as JSON and format nicely for the log
+                try:
+                    json_obj = json.loads(line_stripped)
+                    msg_type = json_obj.get('type', '')
+
+                    if msg_type == 'assistant':
+                        # Log tool invocations
+                        message = json_obj.get('message', {})
+                        content = message.get('content', [])
+                        for item in content:
+                            if item.get('type') == 'tool_use':
+                                tool_name = item.get('name', 'unknown')
+                                tool_id = item.get('id', '')
+                                tool_input = json.dumps(item.get('input', {}), indent=2)
+                                log_file.write(f"[{timestamp}] <invoke name=\"{tool_name}\" id=\"{tool_id}\">\n")
+                                log_file.write(f"[{timestamp}]   Input: {tool_input}\n")
+                                log_file.write(f"[{timestamp}] </invoke>\n")
+                            elif item.get('type') == 'text':
+                                text = item.get('text', '')
+                                log_file.write(f"[{timestamp}] [TEXT] {text}\n")
+
+                    elif msg_type == 'user':
+                        # Log tool results
+                        message = json_obj.get('message', {})
+                        content = message.get('content', [])
+                        for item in content:
+                            if item.get('type') == 'tool_result':
+                                tool_id = item.get('tool_use_id', '')
+                                result_content = item.get('content', '')
+                                if len(result_content) > 500:
+                                    result_preview = result_content[:500] + f"... [{len(result_content)-500} more chars]"
+                                else:
+                                    result_preview = result_content
+                                log_file.write(f"[{timestamp}] <function_results tool_use_id=\"{tool_id}\">\n")
+                                log_file.write(f"[{timestamp}]   {result_preview}\n")
+                                log_file.write(f"[{timestamp}] </function_results>\n")
+
+                    elif msg_type == 'result':
+                        # Log final result
+                        subtype = json_obj.get('subtype', '')
+                        result = json_obj.get('result', '')
+                        duration_ms = json_obj.get('duration_ms', 0)
+                        num_turns = json_obj.get('num_turns', 0)
+                        log_file.write(f"[{timestamp}] [FINAL_RESULT] Status: {subtype}\n")
+                        log_file.write(f"[{timestamp}]   Duration: {duration_ms}ms\n")
+                        log_file.write(f"[{timestamp}]   Turns: {num_turns}\n")
+                        log_file.write(f"[{timestamp}]   Result: {result}\n")
+
+                    # For other types, just log the raw JSON (truncated)
+                    elif msg_type not in ['system']:  # Skip system messages in log
+                        if len(line_stripped) > 200:
+                            log_file.write(f"[{timestamp}] [{msg_type.upper()}] {line_stripped[:200]}...\n")
+                        else:
+                            log_file.write(f"[{timestamp}] [{msg_type.upper()}] {line_stripped}\n")
+
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    # Not JSON or malformed, log as-is
+                    log_file.write(f"[{timestamp}] {line_stripped}\n")
+
+                log_file.flush()
+
+            # Check for compaction signals
+            if compaction_event is not None:
+                line_lower = line.lower()
+                for pattern in compaction_patterns:
+                    if pattern in line_lower:
+                        logger.log_event("COMPACTION_DETECTED", f"Detected compaction signal: {pattern}")
+                        compaction_event.set()
+                        return  # Stop reading immediately
     except Exception as e:
         logger.log_error("STREAM_READ_ERROR", f"Error reading {stream_name}: {e}")
 
@@ -133,16 +222,18 @@ def heartbeat_monitor(process, logger: DetailedLogger, interval: int = 30, stop_
 class StreamingSubprocess:
     """Context manager for subprocess with streaming output capture and heartbeat monitoring."""
 
-    def __init__(self, cmd: list, env: dict, logger: Optional[DetailedLogger], timeout: int):
+    def __init__(self, cmd: list, env: dict, logger: Optional[DetailedLogger], timeout: int, log_file: Optional[TextIO] = None):
         self.cmd = cmd
         self.env = env
         self.logger = logger or DetailedLogger(open('/dev/null', 'w'))
         self.timeout = timeout
+        self.log_file = log_file
         self.process = None
         self.stdout_lines = []
         self.stderr_lines = []
         self.timestamped_stdout = []  # List of (timestamp, line) tuples
         self.stop_event = threading.Event()
+        self.compaction_event = threading.Event()
         self.threads = []
 
     def __enter__(self):
@@ -159,11 +250,11 @@ class StreamingSubprocess:
         # Start reader and heartbeat threads
         stdout_thread = threading.Thread(
             target=stream_output_reader,
-            args=(self.process.stdout, self.stdout_lines, 'stdout', self.logger, self.timestamped_stdout)
+            args=(self.process.stdout, self.stdout_lines, 'stdout', self.logger, self.timestamped_stdout, self.compaction_event, self.log_file)
         )
         stderr_thread = threading.Thread(
             target=stream_output_reader,
-            args=(self.process.stderr, self.stderr_lines, 'stderr', self.logger)
+            args=(self.process.stderr, self.stderr_lines, 'stderr', self.logger, None, self.compaction_event, None)
         )
         heartbeat_thread = threading.Thread(
             target=heartbeat_monitor,
@@ -184,33 +275,61 @@ class StreamingSubprocess:
             t.join(timeout=2)
         return False
 
-    def wait_with_timeout(self) -> tuple[int, str, str, list]:
+    def wait_with_timeout(self) -> tuple[int, str, str, list, bool]:
         """
         Wait for process to complete with timeout.
 
         Returns:
-            Tuple of (returncode, stdout_text, stderr_text, timestamped_stdout)
+            Tuple of (returncode, stdout_text, stderr_text, timestamped_stdout, compaction_detected)
 
         Raises:
             subprocess.TimeoutExpired: If timeout is exceeded
         """
-        returncode = self.process.wait(timeout=self.timeout)
-        stdout_text = ''.join(self.stdout_lines)
-        stderr_text = ''.join(self.stderr_lines)
-        return returncode, stdout_text, stderr_text, self.timestamped_stdout
+        # Poll for process completion or compaction detection
+        poll_interval = 0.1  # Check every 100ms
+        elapsed = 0.0
 
-    def kill(self) -> tuple[str, str, list]:
+        while elapsed < self.timeout:
+            # Check if compaction was detected
+            if self.compaction_event.is_set():
+                self.logger.log_event("COMPACTION_KILL", "Killing process due to compaction detection")
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait()
+
+                stdout_text = ''.join(self.stdout_lines)
+                stderr_text = ''.join(self.stderr_lines)
+                return 0, stdout_text, stderr_text, self.timestamped_stdout, True
+
+            # Check if process completed naturally
+            returncode = self.process.poll()
+            if returncode is not None:
+                stdout_text = ''.join(self.stdout_lines)
+                stderr_text = ''.join(self.stderr_lines)
+                return returncode, stdout_text, stderr_text, self.timestamped_stdout, False
+
+            time.sleep(poll_interval)
+            elapsed += poll_interval
+
+        # Timeout reached
+        raise subprocess.TimeoutExpired(self.cmd, self.timeout)
+
+    def kill(self) -> tuple[str, str, list, bool]:
         """
         Kill the process and return captured output.
 
         Returns:
-            Tuple of (stdout_text, stderr_text, timestamped_stdout)
+            Tuple of (stdout_text, stderr_text, timestamped_stdout, compaction_detected)
         """
         self.process.kill()
         self.process.wait()
         stdout_text = ''.join(self.stdout_lines)
         stderr_text = ''.join(self.stderr_lines)
-        return stdout_text, stderr_text, self.timestamped_stdout
+        compaction_detected = self.compaction_event.is_set()
+        return stdout_text, stderr_text, self.timestamped_stdout, compaction_detected
 
 
 @dataclass
@@ -222,6 +341,7 @@ class IterationResult:
     iteration_num: int = 0
     max_turns_reached: bool = False
     timeout_occurred: bool = False
+    compaction_detected: bool = False
     feedback_summary: Optional[str] = None
     input_tokens: int = 0
     output_tokens: int = 0
@@ -236,6 +356,7 @@ class IterationResult:
             'iteration_num': self.iteration_num,
             'max_turns_reached': self.max_turns_reached,
             'timeout_occurred': self.timeout_occurred,
+            'compaction_detected': self.compaction_detected,
             'input_tokens': self.input_tokens,
             'output_tokens': self.output_tokens,
             'duration_seconds': self.duration_seconds,
@@ -281,6 +402,8 @@ def _run_cli_iteration_impl(
         log_file.write(f"TIMEOUT: {timeout}s\n")
         log_file.write(f"PROMPT LENGTH: {len(prompt)} chars\n")
         log_file.write(f"{'='*80}\n")
+        log_file.write(f"STREAMING OUTPUT (real-time):\n")
+        log_file.write(f"{'='*80}\n")
         log_file.flush()
 
     if logger:
@@ -292,22 +415,26 @@ def _run_cli_iteration_impl(
 
     try:
         # Use context manager for subprocess with streaming output
-        with StreamingSubprocess(cmd, env, logger, timeout) as proc:
+        with StreamingSubprocess(cmd, env, logger, timeout, log_file) as proc:
             try:
-                returncode, stdout_text, stderr_text, timestamped_stdout = proc.wait_with_timeout()
+                returncode, stdout_text, stderr_text, timestamped_stdout, compaction_detected = proc.wait_with_timeout()
                 duration = (datetime.now() - execution_start).total_seconds()
 
                 if logger:
                     logger.log_subprocess_end(returncode, duration)
 
-                # Log full output to file
+                # Log completion metadata to file (stdout was already streamed in real-time)
                 if log_file:
-                    log_file.write(f"\nRETURN CODE: {returncode}\n")
+                    log_file.write(f"\n{'='*80}\n")
+                    log_file.write(f"STREAMING COMPLETE\n")
+                    log_file.write(f"RETURN CODE: {returncode}\n")
                     log_file.write(f"DURATION: {duration:.2f}s\n")
-                    log_file.write(f"\n--- STDOUT ({len(stdout_text)} chars) ---\n")
-                    log_file.write(stdout_text)
-                    log_file.write(f"\n--- STDERR ({len(stderr_text)} chars) ---\n")
-                    log_file.write(stderr_text)
+                    if compaction_detected:
+                        log_file.write(f"⚠️  COMPACTION DETECTED - Iteration terminated early\n")
+                    # Only write stderr since stdout was streamed in real-time
+                    if stderr_text.strip():
+                        log_file.write(f"\n--- STDERR ({len(stderr_text)} chars) ---\n")
+                        log_file.write(stderr_text)
                     log_file.write(f"\n{'='*80}\n")
                     log_file.flush()
 
@@ -324,10 +451,11 @@ def _run_cli_iteration_impl(
                 output_tokens = estimate_tokens(stdout_text)
 
                 return IterationResult(
-                    success=returncode == 0,
+                    success=returncode == 0 and not compaction_detected,
                     output=stdout_text,
                     error=stderr_text if returncode != 0 else None,
                     max_turns_reached=max_turns_reached,
+                    compaction_detected=compaction_detected,
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     duration_seconds=duration,
@@ -341,14 +469,19 @@ def _run_cli_iteration_impl(
                     logger.log_timeout(timeout)
 
                 # Kill the process and get partial output
-                stdout_text, stderr_text, timestamped_stdout = proc.kill()
+                stdout_text, stderr_text, timestamped_stdout, compaction_detected = proc.kill()
 
                 error_msg = f'Iteration timed out after {timeout} seconds'
                 if log_file:
-                    log_file.write(f"\n❌ TIMEOUT ERROR: {error_msg}\n")
+                    log_file.write(f"\n{'='*80}\n")
+                    log_file.write(f"❌ TIMEOUT ERROR: {error_msg}\n")
                     log_file.write(f"DURATION: {duration:.2f}s\n")
-                    log_file.write(f"\nPartial STDOUT ({len(stdout_text)} chars):\n{stdout_text}\n")
-                    log_file.write(f"\nPartial STDERR ({len(stderr_text)} chars):\n{stderr_text}\n")
+                    if compaction_detected:
+                        log_file.write(f"⚠️  COMPACTION DETECTED during timeout\n")
+                    # Stdout was already streamed in real-time, only write stderr
+                    if stderr_text.strip():
+                        log_file.write(f"\nPartial STDERR ({len(stderr_text)} chars):\n{stderr_text}\n")
+                    log_file.write(f"\n{'='*80}\n")
                     log_file.flush()
 
                 # Estimate token usage even for timeout
@@ -360,6 +493,7 @@ def _run_cli_iteration_impl(
                     output=stdout_text,
                     error=error_msg,
                     timeout_occurred=True,
+                    compaction_detected=compaction_detected,
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     duration_seconds=duration,
@@ -406,19 +540,18 @@ def estimate_tokens(text: str) -> int:
     return len(text) // 4
 
 
-def create_run_directory() -> Path:
-    """Create a timestamped directory for this Ralph run."""
+def get_work_dir_basename() -> str:
+    """Get the basename of the current working directory."""
+    return Path.cwd().name
+
+
+def create_log_file_path() -> str:
+    """Create log file path with work directory basename and timestamp."""
+    work_dir = get_work_dir_basename()
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    run_dir = Path(f'/tmp/ralph_{timestamp}')
-    run_dir.mkdir(parents=True, exist_ok=True)
-    return run_dir
+    return f'/tmp/ralph_{work_dir}_{timestamp}_iteration.log'
 
 
-def create_iteration_directory(run_dir: Path, iteration_num: int) -> Path:
-    """Create a directory for a specific iteration."""
-    iter_dir = run_dir / f'iteration_{iteration_num:02d}'
-    iter_dir.mkdir(parents=True, exist_ok=True)
-    return iter_dir
 
 
 def truncate_with_indicator(text: str, max_length: int = 1024) -> str:
@@ -430,202 +563,170 @@ def truncate_with_indicator(text: str, max_length: int = 1024) -> str:
 
 def parse_tool_use_from_output(output: str) -> list:
     """
-    Parse tool use and results from Claude CLI output.
+    Parse tool use and results from Claude CLI JSON output.
     Returns list of dicts with tool information including errors and return codes.
     """
+    import json
     import re
 
     tools = []
     lines = output.split('\n')
 
-    i = 0
-    while i < len(lines):
-        line = lines[i]
+    # Map tool_use_id to tool info for matching results with invocations
+    tool_map = {}
 
-        # Look for tool invocation patterns - Claude CLI typically shows these
-        # Pattern: "Using <tool_name>:" or similar
-        if 'invoke name=' in line or '<invoke' in line:
-            tool_info = {
-                'type': 'tool_use',
-                'name': '',
-                'input': '',
-                'result': '',
-                'has_error': False,
-                'return_code': None,
-                'error_message': ''
-            }
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
 
-            # Try to extract tool name
-            name_match = re.search(r'invoke name="([^"]+)"', line)
-            if name_match:
-                tool_info['name'] = name_match.group(1)
+        try:
+            json_obj = json.loads(line)
+            msg_type = json_obj.get('type', '')
 
-            # Collect input (next few lines until we see result or new tool)
-            j = i + 1
-            input_lines = []
-            while j < len(lines) and j < i + 50:  # Look ahead max 50 lines
-                if '<invoke' in lines[j] or 'function_results' in lines[j]:
-                    break
-                if lines[j].strip():
-                    input_lines.append(lines[j])
-                j += 1
+            if msg_type == 'assistant':
+                # Extract tool invocations
+                message = json_obj.get('message', {})
+                content = message.get('content', [])
 
-            tool_info['input'] = truncate_with_indicator('\n'.join(input_lines), 1024)
+                for item in content:
+                    if item.get('type') == 'tool_use':
+                        tool_id = item.get('id', '')
+                        tool_name = item.get('name', '')
+                        tool_input = item.get('input', {})
 
-            # Look for results
-            k = j
-            while k < len(lines) and k < i + 100:  # Look ahead max 100 lines
-                if 'function_results' in lines[k] or '<function_results>' in lines[k]:
-                    result_lines = []
-                    k += 1
-                    while k < len(lines) and '</function_results>' not in lines[k] and k < i + 100:
-                        result_lines.append(lines[k])
-                        k += 1
+                        tool_info = {
+                            'type': 'tool_use',
+                            'name': tool_name,
+                            'input': truncate_with_indicator(json.dumps(tool_input, indent=2), 1024),
+                            'result': '',
+                            'has_error': False,
+                            'return_code': None,
+                            'error_message': ''
+                        }
 
-                    result_text = '\n'.join(result_lines)
+                        tool_map[tool_id] = tool_info
+                        tools.append(tool_info)
 
-                    # Check for errors in the result
-                    if '<error>' in result_text or 'Error:' in result_text or 'error' in result_text.lower():
-                        tool_info['has_error'] = True
+            elif msg_type == 'user':
+                # Extract tool results
+                message = json_obj.get('message', {})
+                content = message.get('content', [])
 
-                        # Try to extract error message
-                        error_match = re.search(r'<error>(.*?)</error>', result_text, re.DOTALL)
-                        if error_match:
-                            tool_info['error_message'] = truncate_with_indicator(error_match.group(1).strip(), 512)
-                        else:
-                            # Look for other error patterns
-                            for line_text in result_lines:
-                                if 'error' in line_text.lower():
-                                    tool_info['error_message'] = truncate_with_indicator(line_text.strip(), 512)
-                                    break
+                for item in content:
+                    if item.get('type') == 'tool_result':
+                        tool_id = item.get('tool_use_id', '')
+                        result_content = item.get('content', '')
 
-                    # For Bash tool, look for "Exit code" or return code
-                    if tool_info['name'] == 'Bash' or 'exit code' in result_text.lower():
-                        exit_match = re.search(r'Exit code[:\s]+(\d+)', result_text, re.IGNORECASE)
-                        if exit_match:
-                            tool_info['return_code'] = int(exit_match.group(1))
-                            if tool_info['return_code'] != 0:
+                        if tool_id in tool_map:
+                            tool_info = tool_map[tool_id]
+
+                            # Check for errors in result
+                            if '<error>' in result_content or 'Error:' in result_content:
                                 tool_info['has_error'] = True
+                                # Try to extract error message
+                                error_match = re.search(r'<error>(.*?)</error>', result_content, re.DOTALL)
+                                if error_match:
+                                    tool_info['error_message'] = truncate_with_indicator(error_match.group(1).strip(), 512)
 
-                    tool_info['result'] = truncate_with_indicator(result_text, 1024)
-                    break
-                k += 1
+                            # For Bash tool, look for exit code
+                            if tool_info['name'] == 'Bash':
+                                exit_match = re.search(r'Exit code[:\s]+(\d+)', result_content, re.IGNORECASE)
+                                if exit_match:
+                                    tool_info['return_code'] = int(exit_match.group(1))
+                                    if tool_info['return_code'] != 0:
+                                        tool_info['has_error'] = True
 
-            if tool_info['name']:
-                tools.append(tool_info)
-            i = k
-        else:
-            i += 1
+                            tool_info['result'] = truncate_with_indicator(result_content, 1024)
+
+        except (json.JSONDecodeError, KeyError, TypeError):
+            # Not JSON or malformed, skip
+            continue
 
     return tools
 
 
-def write_iteration_logs(iter_dir: Path, result: IterationResult, prompt: str, command: list):
+def write_iteration_to_log(log_file: TextIO, result: IterationResult, command: list):
     """
-    Write comprehensive logs for an iteration to its directory.
+    Write iteration data to the consolidated log file.
 
-    Creates multiple files:
-    - log.txt: Main log with formatted output resembling Claude CLI
-    - metadata.json: Structured metadata about the iteration
-    - prompt.txt: The wrapped prompt sent to Claude
-    - output.txt: Raw output from Claude
-    - stderr.txt: Error output if any
+    This appends iteration details to the single log file rather than creating
+    separate per-iteration files.
     """
-    # Write prompt
-    (iter_dir / 'prompt.txt').write_text(prompt, encoding='utf-8')
-
-    # Write raw output
-    (iter_dir / 'output.txt').write_text(result.output, encoding='utf-8')
-
-    # Write stderr if present
-    if result.error:
-        (iter_dir / 'stderr.txt').write_text(result.error, encoding='utf-8')
-
     # Parse tool use from output
     tool_uses = parse_tool_use_from_output(result.output)
 
-    # Write metadata as JSON
-    metadata = {
-        **result.to_dict(),
-        'command': ' '.join(command),
-        'prompt_length': len(prompt),
-        'output_length': len(result.output),
-        'tool_uses_count': len(tool_uses)
-    }
-    (iter_dir / 'metadata.json').write_text(
-        json.dumps(metadata, indent=2),
-        encoding='utf-8'
-    )
+    # Write iteration header
+    log_file.write("\n\n")
+    log_file.write("="*80 + "\n")
+    log_file.write(f"Ralph Loop - Iteration {result.iteration_num}\n")
+    log_file.write(f"Timestamp: {result.timestamp}\n")
+    log_file.write(f"Duration: {result.duration_seconds:.2f}s\n")
+    log_file.write("="*80 + "\n\n")
 
-    # Write main log file with formatted output
-    with open(iter_dir / 'log.txt', 'w', encoding='utf-8') as f:
-        # Header
-        f.write("="*80 + "\n")
-        f.write(f"Ralph Loop - Iteration {result.iteration_num}\n")
-        f.write(f"Timestamp: {result.timestamp}\n")
-        f.write(f"Duration: {result.duration_seconds:.2f}s\n")
-        f.write("="*80 + "\n\n")
+    # Command info
+    log_file.write("Command:\n")
+    log_file.write(f"  {' '.join(command)}\n\n")
 
-        # Command info
-        f.write("Command:\n")
-        f.write(f"  {' '.join(command)}\n\n")
+    # Status
+    status_icon = "✅" if result.success else "❌"
+    log_file.write(f"Status: {status_icon} {'Success' if result.success else 'Failed'}\n")
+    if result.compaction_detected:
+        log_file.write("  ⚠️  Compaction detected - iteration terminated early\n")
+    if result.max_turns_reached:
+        log_file.write("  ⚠️  Max turns limit reached\n")
+    if result.timeout_occurred:
+        log_file.write("  ⚠️  Timeout occurred\n")
+    log_file.write("\n")
 
-        # Status
-        status_icon = "✅" if result.success else "❌"
-        f.write(f"Status: {status_icon} {'Success' if result.success else 'Failed'}\n")
-        if result.max_turns_reached:
-            f.write("  ⚠️  Max turns limit reached\n")
-        if result.timeout_occurred:
-            f.write("  ⚠️  Timeout occurred\n")
-        f.write("\n")
+    # Token usage
+    log_file.write("Token Usage (estimated):\n")
+    log_file.write(f"  Input:  {result.input_tokens:,} tokens\n")
+    log_file.write(f"  Output: {result.output_tokens:,} tokens\n")
+    log_file.write(f"  Total:  {result.input_tokens + result.output_tokens:,} tokens\n")
+    log_file.write("\n")
 
-        # Token usage
-        f.write("Token Usage (estimated):\n")
-        f.write(f"  Input:  {result.input_tokens:,} tokens\n")
-        f.write(f"  Output: {result.output_tokens:,} tokens\n")
-        f.write(f"  Total:  {result.input_tokens + result.output_tokens:,} tokens\n")
-        f.write("\n")
+    # Tool summary if any
+    if tool_uses:
+        log_file.write(f"Tools Used: {len(tool_uses)}\n")
+        for i, tool in enumerate(tool_uses, 1):
+            log_file.write(f"  {i}. {tool['name']}\n")
+        log_file.write("\n")
 
-        # Tool summary if any
-        if tool_uses:
-            f.write(f"Tools Used: {len(tool_uses)}\n")
-            for i, tool in enumerate(tool_uses, 1):
-                f.write(f"  {i}. {tool['name']}\n")
-            f.write("\n")
+    # Note about streamed output (output was already written in real-time above)
+    log_file.write("="*80 + "\n")
+    log_file.write("Claude Output (with timestamps)\n")
+    log_file.write("="*80 + "\n\n")
+    log_file.write("(Output was streamed in real-time above - see STREAMING OUTPUT section)\n")
 
-        # Separator
-        f.write("="*80 + "\n")
-        f.write("Claude Output (with timestamps)\n")
-        f.write("="*80 + "\n\n")
+    # Errors if any
+    if result.error:
+        log_file.write("\n\n")
+        log_file.write("="*80 + "\n")
+        log_file.write("Errors\n")
+        log_file.write("="*80 + "\n\n")
+        log_file.write(result.error)
 
-        # Main output with timestamps if available
-        if result.timestamped_lines:
-            for timestamp, line in result.timestamped_lines:
-                # Remove trailing newline from line since we'll add it back
-                line_stripped = line.rstrip('\n')
-                f.write(f"[{timestamp}] {line_stripped}\n")
-        else:
-            # Fallback to plain output
-            f.write(result.output)
-
-        # Errors if any
-        if result.error:
-            f.write("\n\n")
-            f.write("="*80 + "\n")
-            f.write("Errors\n")
-            f.write("="*80 + "\n\n")
-            f.write(result.error)
-
-        # Footer
-        f.write("\n\n")
-        f.write("="*80 + "\n")
-        f.write(f"End of Iteration {result.iteration_num}\n")
-        f.write("="*80 + "\n")
+    # Footer
+    log_file.write("\n\n")
+    log_file.write("="*80 + "\n")
+    log_file.write(f"End of Iteration {result.iteration_num}\n")
+    log_file.write("="*80 + "\n")
+    log_file.flush()
 
 
 def extract_iteration_feedback(result: IterationResult) -> str:
     """Extract feedback from iteration result to pass to next iteration."""
     feedback_parts = []
+
+    # Check for compaction detection (highest priority)
+    if result.compaction_detected:
+        feedback_parts.append(
+            "⚠️ PREVIOUS ITERATION DETECTED CONVERSATION COMPACTION\n"
+            "The last iteration was stopped early because Claude was about to compact the conversation.\n"
+            "This indicates the context window was getting full.\n"
+            "GUIDANCE: The iteration was terminated to preserve context. Continue with the next task."
+        )
 
     # Check for max turns
     if result.max_turns_reached:
@@ -645,7 +746,7 @@ def extract_iteration_feedback(result: IterationResult) -> str:
         )
 
     # Check for general errors
-    if result.error and not result.max_turns_reached and not result.timeout_occurred:
+    if result.error and not result.max_turns_reached and not result.timeout_occurred and not result.compaction_detected:
         feedback_parts.append(
             f"⚠️ PREVIOUS ITERATION ENCOUNTERED AN ERROR\n"
             f"Error: {result.error[:500]}\n"
@@ -710,7 +811,7 @@ def create_wrapped_prompt(user_prompt: str, iteration_num: int, outer_prompt_tem
     )
 
 
-def run_claude_iteration(prompt: str, model: str = 'opus', max_turns: int = 50, timeout: int = 600, log_file: Optional[TextIO] = None) -> IterationResult:
+def run_claude_iteration(prompt: str, model: str = 'opus', max_turns: int = 50, timeout: int = 600, log_file: Optional[TextIO] = None, system_prompt: Optional[str] = None) -> IterationResult:
     """Run one iteration using Claude Code CLI with detailed logging and streaming output."""
     cmd = [
         'claude',
@@ -718,8 +819,15 @@ def run_claude_iteration(prompt: str, model: str = 'opus', max_turns: int = 50, 
         '--dangerously-skip-permissions',
         '--max-turns', str(max_turns),
         '--model', model,
-        '-p', prompt
+        '--output-format', 'stream-json',
+        '--verbose'
     ]
+
+    if system_prompt:
+        cmd.extend(['--system-prompt', system_prompt])
+
+    cmd.extend(['-p', prompt])
+
     return _run_cli_iteration_impl(cmd, 'claude', prompt, timeout, log_file)
 
 
@@ -771,6 +879,7 @@ Examples:
   %(prog)s "Implement auth" --max-iterations 20 --max-turns 20 --human-in-the-loop
   %(prog)s "Complete all tasks in PRD.md" --max-iterations 40 --max-turns 25 --model sonnet
   %(prog)s "Run tests" --max-iterations 5 --model haiku
+  %(prog)s "Build feature" --system-prompt "You are an expert Python developer"
         """
     )
 
@@ -823,13 +932,19 @@ Examples:
         '--log-file',
         type=str,
         default=None,
-        help='Path to log file (default: /tmp/ralph_[timestamp].log)'
+        help='Path to log file (default: /tmp/ralph_[work-dir-basename]_[timestamp]_iteration.log)'
     )
     parser.add_argument(
         '--outer-prompt',
         type=str,
         default=None,
         help='Path to outer prompt template file (default: prompts/outer-prompt-default.md)'
+    )
+    parser.add_argument(
+        '--system-prompt',
+        type=str,
+        default=None,
+        help='System prompt to pass to Claude CLI'
     )
 
     args = parser.parse_args()
@@ -857,12 +972,9 @@ Examples:
     elif not args.prompt:
         parser.error("Either provide a prompt argument or use --prompt-file/-f")
 
-    # Create run directory for all logs
-    run_dir = create_run_directory()
-
-    # Set up main log file (consolidated across all iterations)
+    # Set up main log file (single file for entire run)
     if args.log_file is None:
-        args.log_file = str(run_dir / 'ralph.log')
+        args.log_file = create_log_file_path()
 
     # Create log file and set up tee logger
     log_file = open(args.log_file, 'w', encoding='utf-8')
@@ -881,8 +993,7 @@ Examples:
             return 1
 
         print("🚀 Ralph Loop Starting")
-        print(f"📁 Run directory: {run_dir}")
-        print(f"📝 Main log: {args.log_file}")
+        print(f"📝 Log file: {args.log_file}")
         print(f"Task: {args.prompt}")
         print(f"Max iterations: {args.max_iterations}")
         print(f"Max turns per iteration: {args.max_turns}")
@@ -890,6 +1001,8 @@ Examples:
         print(f"CLI: {args.cli_type}")
         if args.cli_type == 'claude':
             print(f"Model: {args.model}")
+            if args.system_prompt:
+                print(f"System prompt: {args.system_prompt}")
         print(f"Human-in-the-loop: {args.human_in_the_loop}")
         print("="*60)
 
@@ -898,6 +1011,32 @@ Examples:
         initial_tokens = estimate_tokens(initial_prompt)
         print(f"\n📊 Initial prompt size: {initial_tokens:,} tokens (estimated)")
         print("="*60)
+
+        # Print full prompt to console once (before first iteration)
+        print("\n" + "="*60)
+        print("INITIAL WRAPPED PROMPT")
+        print("="*60)
+        print(initial_prompt)
+        print("="*60)
+
+        # Write initial prompt to log file once at the start
+        log_file.write("="*80 + "\n")
+        log_file.write("Ralph Loop - Initial Configuration\n")
+        log_file.write("="*80 + "\n\n")
+        log_file.write(f"Task: {args.prompt}\n")
+        log_file.write(f"Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        log_file.write(f"Max iterations: {args.max_iterations}\n")
+        log_file.write(f"Max turns per iteration: {args.max_turns}\n")
+        log_file.write(f"Timeout per iteration: {args.timeout} seconds\n")
+        log_file.write(f"CLI: {args.cli_type}\n")
+        if args.cli_type == 'claude':
+            log_file.write(f"Model: {args.model}\n")
+            if args.system_prompt:
+                log_file.write(f"System prompt: {args.system_prompt}\n")
+        log_file.write(f"\n--- INITIAL WRAPPED PROMPT ---\n")
+        log_file.write(initial_prompt)
+        log_file.write(f"\n--- END INITIAL WRAPPED PROMPT ---\n\n")
+        log_file.flush()
 
         start_time = datetime.now()
         previous_result: Optional[IterationResult] = None
@@ -917,33 +1056,24 @@ Examples:
             # Create wrapped prompt with feedback
             wrapped_prompt = create_wrapped_prompt(args.prompt, iteration, outer_prompt_template, feedback)
 
-            # Log the wrapped prompt to file
-            log_file.write(f"\n\n{'#'*80}\n")
-            log_file.write(f"# ITERATION {iteration}/{args.max_iterations}\n")
-            log_file.write(f"# {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            log_file.write(f"{'#'*80}\n")
-            log_file.write(f"\n--- WRAPPED PROMPT ---\n")
-            log_file.write(wrapped_prompt)
-            log_file.write(f"\n--- END WRAPPED PROMPT ---\n")
-            log_file.flush()
-
             # Run iteration
             if args.cli_type == 'claude':
-                result = run_claude_iteration(wrapped_prompt, args.model, args.max_turns, args.timeout, log_file)
+                result = run_claude_iteration(wrapped_prompt, args.model, args.max_turns, args.timeout, log_file, args.system_prompt)
                 cmd_used = [
                     'claude', '--print', '--dangerously-skip-permissions',
-                    '--max-turns', str(args.max_turns), '--model', args.model, '-p', '[prompt]'
+                    '--max-turns', str(args.max_turns), '--model', args.model
                 ]
+                if args.system_prompt:
+                    cmd_used.extend(['--system-prompt', args.system_prompt])
+                cmd_used.extend(['-p', '[prompt]'])
             else:
                 result = run_codex_iteration(wrapped_prompt, args.timeout, log_file)
                 cmd_used = ['codex', 'exec', '-s', 'danger-full-access', '[prompt]']
 
             result.iteration_num = iteration
 
-            # Create iteration directory and write logs
-            iter_dir = create_iteration_directory(run_dir, iteration)
-            write_iteration_logs(iter_dir, result, wrapped_prompt, cmd_used)
-            print(f"📁 Iteration logs: {iter_dir}")
+            # Write iteration data to consolidated log file
+            write_iteration_to_log(log_file, result, cmd_used)
 
             # Track cumulative tokens
             cumulative_input_tokens += result.input_tokens
@@ -957,6 +1087,22 @@ Examples:
 
             # Store result for next iteration's feedback
             previous_result = result
+
+            # Check for compaction detection
+            if result.compaction_detected:
+                print("\n" + "="*60)
+                print("⚠️  COMPACTION DETECTED")
+                print("="*60)
+                print("Claude was about to compact the conversation.")
+                print("Iteration terminated early to preserve context.")
+                print("Moving to next iteration...")
+                print("="*60)
+
+                # Continue to next iteration
+                if args.human_in_the_loop:
+                    if not human_in_the_loop():
+                        break
+                continue
 
             # Check for errors
             if not result.success:
@@ -1043,31 +1189,30 @@ Examples:
         print(f"   Output: {cumulative_output_tokens:,} tokens")
         print(f"   Total:  {total_tokens:,} tokens")
 
-        # Write run summary to run directory
-        summary_file = run_dir / 'summary.txt'
-        with open(summary_file, 'w', encoding='utf-8') as f:
-            f.write("="*80 + "\n")
-            f.write("Ralph Loop Run Summary\n")
-            f.write("="*80 + "\n\n")
-            f.write(f"Task: {args.prompt}\n")
-            f.write(f"Start time: {start_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"End time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"Total elapsed: {elapsed}\n")
-            f.write(f"Iterations completed: {iteration}\n")
-            f.write(f"Max iterations: {args.max_iterations}\n\n")
-            f.write(f"Token usage (estimated):\n")
-            f.write(f"  Input:  {cumulative_input_tokens:,} tokens\n")
-            f.write(f"  Output: {cumulative_output_tokens:,} tokens\n")
-            f.write(f"  Total:  {total_tokens:,} tokens\n\n")
-            f.write(f"Configuration:\n")
-            f.write(f"  CLI type: {args.cli_type}\n")
-            if args.cli_type == 'claude':
-                f.write(f"  Model: {args.model}\n")
-            f.write(f"  Max turns: {args.max_turns}\n")
-            f.write(f"  Timeout: {args.timeout}s\n\n")
-            f.write(f"Run directory: {run_dir}\n")
-
-        print(f"\n📄 Run summary: {summary_file}")
+        # Write run summary to log file
+        log_file.write("\n\n")
+        log_file.write("="*80 + "\n")
+        log_file.write("Ralph Loop Run Summary\n")
+        log_file.write("="*80 + "\n\n")
+        log_file.write(f"Task: {args.prompt}\n")
+        log_file.write(f"Start time: {start_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        log_file.write(f"End time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        log_file.write(f"Total elapsed: {elapsed}\n")
+        log_file.write(f"Iterations completed: {iteration}\n")
+        log_file.write(f"Max iterations: {args.max_iterations}\n\n")
+        log_file.write(f"Token usage (estimated):\n")
+        log_file.write(f"  Input:  {cumulative_input_tokens:,} tokens\n")
+        log_file.write(f"  Output: {cumulative_output_tokens:,} tokens\n")
+        log_file.write(f"  Total:  {total_tokens:,} tokens\n\n")
+        log_file.write(f"Configuration:\n")
+        log_file.write(f"  CLI type: {args.cli_type}\n")
+        if args.cli_type == 'claude':
+            log_file.write(f"  Model: {args.model}\n")
+            if args.system_prompt:
+                log_file.write(f"  System prompt: {args.system_prompt}\n")
+        log_file.write(f"  Max turns: {args.max_turns}\n")
+        log_file.write(f"  Timeout: {args.timeout}s\n")
+        log_file.flush()
 
         # Show final git status
         print("\n📊 Final git status:")
@@ -1086,8 +1231,7 @@ Examples:
         # Always clean up logger and close log file
         logger.restore()
         log_file.close()
-        print(f"\n📁 All logs saved to: {run_dir}", file=sys.stdout)
-        print(f"📄 Main log: {args.log_file}", file=sys.stdout)
+        print(f"\n📄 Log file: {args.log_file}", file=sys.stdout)
 
 
 if __name__ == '__main__':
