@@ -8,6 +8,8 @@ CONTEXT (DO THIS FIRST):
 YOUR TASK:
 {user_prompt}
 
+NOTE: Do not read prompt files - they are already in the context.
+
 MANDATORY TWO-PHASE WORKFLOW:
 
 ═══════════════════════════════════════════════════════════════

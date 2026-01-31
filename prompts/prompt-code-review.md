@@ -9,4 +9,4 @@ Review the code in the current project carefully looking for:
 4. Anything stale or out of date
 5. Any passwords/tokens or other sensitive artefacts
 
-Implement fixes for each of these.
+Document your findings carefully.
