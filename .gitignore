@@ -10,3 +10,7 @@ __pycache__/
 dist/
 build/
 .env
+src/ralph.egg-info/
+.pytest_cache/
+*.whl
+*.tar.gz
