@@ -1,44 +1,67 @@
-RALPH LOOP ITERATION {iteration_num} - CRITICAL INSTRUCTIONS:
+# Ralph Loop Iteration {iteration_num}
+
+## Iteration Context
+
 {feedback}
-CONTEXT (DO THIS FIRST):
-- Check if progress.md exists and read it FIRST
-- Review git log and git status
-- Build incrementally on what exists
 
-YOUR TASK:
-{user_prompt}
-
-NOTE: Do not read prompt files - they are already in the context.
-
-MANDATORY TWO-PHASE WORKFLOW:
-
-═══════════════════════════════════════════════════════════════
-PHASE 1 - PLANNING (until plan is sufficiently detailed)
-═══════════════════════════════════════════════════════════════
-
-ITERATIVE PLANNING: You may need multiple iterations to get the plan right!
-
-1. Read existing progress.md (if it exists)
-2. Check for feedback from previous iteration (see above)
-   - If MAX TURNS was hit: Current task is TOO LARGE
-     * Break it into smaller, more focused subtasks
-     * Each subtask should be completable in fewer turns
-     * Update progress.md with the refined breakdown
-   - If TIMEOUT occurred: Simplify or split the current task
-   - If ERROR occurred: Address the error before proceeding
-3. Evaluate the current plan:
-   - Is there a plan already? If NO → Create initial plan
-   - If YES → Is it sufficiently detailed for implementation?
-     * Are tasks broken down into clear, actionable subtasks?
-     * Do subtasks have clear steps?
-     * Are files and expected outcomes specified for each task?
-     * Are dependencies between tasks clear?
-     * Can you implement Task 1 immediately with confidence?
-   - If plan needs MORE DETAIL → Refine and expand it
-
-4. Create/update progress.md using this CONCISE format:
+**Before you begin:**
+1. Read `PROGRESS.md` if it exists (this is your source of truth)
+2. Review git log and git status to understand current state
+3. Build incrementally on existing work
 
 ---
+
+## Your Task
+
+{user_prompt}
+
+> Note: Prompt files are already in context - do not read them.
+
+---
+
+## Workflow Overview
+
+Ralph Loop uses a **mandatory two-phase workflow**: Planning → Implementation
+
+- **Phase 1 (Planning)**: Create or refine a detailed plan in `PROGRESS.md`
+- **Phase 2 (Implementation)**: Execute one task at a time from the plan
+
+After each commit, you will be terminated and re-run for the next step.
+
+---
+
+## Phase 1: Planning
+
+**Goal:** Create a sufficiently detailed plan before any implementation.
+
+### Planning may require multiple iterations
+
+Each iteration, evaluate the current state:
+
+1. **Read existing `PROGRESS.md`** (if it exists)
+
+2. **Check feedback** from previous iteration (shown above)
+   - MAX TURNS hit → Current task is too large, break into smaller subtasks
+   - TIMEOUT occurred → Simplify or split the current task
+   - ERROR occurred → Address the error before proceeding
+
+3. **Evaluate the plan:**
+   - Does a plan exist?
+     - **No** → Create initial plan
+     - **Yes** → Is it detailed enough for implementation?
+
+   A plan is ready when:
+   - Tasks are broken into clear, actionable subtasks
+   - Each subtask has defined steps
+   - Files and expected outcomes are specified
+   - Dependencies between tasks are clear
+   - You can implement Task 1 immediately with confidence
+
+   If the plan needs more detail → Refine and expand it
+
+4. **Update `PROGRESS.md`** using this format:
+
+```
 # Project: [Brief project name]
 Objective: [One-line objective]
 Started: [timestamp]
@@ -49,92 +72,108 @@ Subtasks:
 1. Audit file1.py [COMPLETE]
 2. Audit file2.py [IN PROGRESS]
 3. Consider interface between file1.py and file2.py [PENDING]
+
 Expected: [Brief expected outcome]
-Progress: 
+Progress:
 * [Status note 1, timestamp]
 * [Status note 2, timestamp]
 
 ## Task 2: [Task name] [PENDING]
 Files: file3.py
 Expected: [Brief expected outcome]
+```
+
+**Status values:**
+- `[PENDING]` - Not started
+- `[IN PROGRESS]` - Currently being implemented
+- `[COMPLETED YYYY-MM-DD HH:MM]` - Done with timestamp
+- `[NEEDS DETAIL]` - Task exists but needs more planning
+
+5. **Commit and stop:**
+   - If you **refined** the plan: Commit with message "Refine plan: [what you detailed]" → STOP
+   - If plan is **ready**: Commit with message "Plan ready: [summary]" → STOP
 
 ---
 
-STATUS VALUES:
-- [PENDING] - Not started
-- [IN PROGRESS] - Currently being implemented
-- [COMPLETED YYYY-MM-DD HH:MM] - Done, with timestamp
-- [NEEDS DETAIL] - Task exists but needs more planning
+## Phase 2: Implementation
 
-5. If you REFINED the plan (added detail, broke down tasks):
-   - Commit with message: "Refine plan: [what you detailed]"
-   - STOP IMMEDIATELY
-   - You'll be re-run to evaluate if MORE detail is needed
+**Goal:** Execute exactly ONE subtask, then commit and stop.
 
-6. If plan is READY for implementation (sufficiently detailed):
-   - Mark Task 1 as [PENDING] (ready to implement next iteration)
-   - Commit with message: "Plan ready: [summary]"
-   - STOP IMMEDIATELY
-   - You'll be re-run to start Phase 2
+### Work on one subtask at a time
 
-═══════════════════════════════════════════════════════════════
-PHASE 2 - IMPLEMENTATION (when plan is ready and detailed)
-═══════════════════════════════════════════════════════════════
+1. **Read `PROGRESS.md`** to see the task list
 
-WORK ON EXACTLY ONE SUBTASK FROM THE LIST, THEN COMMIT AND STOP!
+2. **Check feedback** from previous iteration (shown above)
+   - If MAX TURNS or TIMEOUT hit:
+     - STOP implementation immediately
+     - Break current task into 2-4 smaller subtasks
+     - Mark original task as `[NEEDS DETAIL]`
+     - Commit with message "Break down task: [task name]"
+     - STOP (next iteration will work on first subtask)
+   - If ERROR occurred: Address the error before continuing
 
-1. Read progress.md to see the task list
-2. Check for feedback from previous iteration (see above)
-   - If MAX TURNS was hit on this task:
-     * The current task is TOO COMPLEX for one iteration
-     * STOP implementation immediately
-     * Break this task into 2-4 smaller subtasks in progress.md
-     * Mark the original task as [NEEDS DETAIL]
-     * Commit the refined plan with message: "Break down task: [task name]"
-     * STOP - next iteration will work on the first subtask
-   - If TIMEOUT occurred: Same as max turns - break it down
-   - If ERROR occurred: Address the error before continuing the task
-3. Identify next task (first task that is [PENDING])
-4. Use TodoWrite to track this ONE specific task
-5. Mark that ONE task as in_progress in TodoWrite
-6. Update progress.md: Change task status to [IN PROGRESS]
-7. Do ONLY that ONE task (do not batch multiple tasks)
-8. Run all quality gates: tests, type checks, linters (all must pass)
-9. Mark the task completed in TodoWrite
-10. Update progress.md inline in the task section:
-   - Change status to [COMPLETED YYYY-MM-DD HH:MM]
-   - Add progress notes directly under the task (e.g., "Progress: Implemented X, tested Y")
-11. Commit all files you touched and updated progress.md together (ignore other changed files in the workspace)
-12. **STOP IMMEDIATELY** - do not continue to next task
+3. **Identify next task** (first task with status `[PENDING]`)
 
-═══════════════════════════════════════════════════════════════
-CRITICAL RULES - MEMORIZE THESE
-═══════════════════════════════════════════════════════════════
+4. **Track the task** using TodoWrite
 
-✓ MUST commit after planning/refining (Phase 1) → STOP
-✓ MUST commit after EACH task completion (Phase 2) → STOP
-✓ Plan can iterate MULTIPLE times until detailed enough
-✓ Do NOT do planning and implementation in the same iteration
-✓ Do NOT batch multiple tasks - ONE task per iteration
-✓ The loop will re-run you for the next phase/task
-✓ Your process WILL BE TERMINATED after each commit
-✓ progress.md is your ONLY tracking file (keep it CONCISE)
-✓ Keep progress notes INLINE with each task (no separate sections)
+5. **Mark task in progress:**
+   - Update TodoWrite: Mark as in_progress
+   - Update `PROGRESS.md`: Change status to `[IN PROGRESS]`
 
-COMPLETION SIGNAL:
-When ALL tasks in the list are [COMPLETED YYYY-MM-DD HH:MM]
-(all requirements met, all tests passing), emit:
+6. **Execute the task** (do not batch multiple tasks)
 
+7. **Run quality gates:** Tests, type checks, linters (all must pass)
+
+8. **Mark task complete:**
+   - Update TodoWrite: Mark as completed
+   - Update `PROGRESS.md`:
+     - Change status to `[COMPLETED YYYY-MM-DD HH:MM]`
+     - Add progress notes inline: "Progress: Implemented X, tested Y"
+
+9. **Commit:** Include all files you touched plus updated `PROGRESS.md`
+
+10. **STOP IMMEDIATELY** - do not continue to next task
+
+---
+
+## Critical Rules
+
+### Workflow enforcement
+
+- Commit after planning/refining (Phase 1) → STOP
+- Commit after each task completion (Phase 2) → STOP
+- Plan can iterate multiple times until detailed enough
+- Do NOT do planning and implementation in the same iteration
+- Do NOT batch multiple tasks - ONE task per iteration
+- Your process WILL BE TERMINATED after each commit
+
+### File management
+
+- `PROGRESS.md` is your ONLY tracking file (keep it concise)
+- Keep progress notes inline with each task (no separate sections)
+- Only commit files you touched plus `PROGRESS.md` (ignore other workspace changes)
+
+### Completion
+
+When ALL tasks are marked `[COMPLETED YYYY-MM-DD HH:MM]` and all requirements are met:
+
+```
 🎯 RALPH_LOOP_COMPLETE 🎯
+```
 
-Only emit when absolutely certain everything is done.
+Only emit this signal when absolutely certain everything is done.
 
-═══════════════════════════════════════════════════════════════
-Check progress.md to determine your phase:
-Pattern: Initial plan → Commit → STOP
-         Refine plan → Commit → STOP (repeat as needed)
-         Plan ready → Commit → STOP
-         Task 1 → Commit → STOP
-         Task 2 → Commit → STOP
-         Task N → Commit → STOP → COMPLETE
-═══════════════════════════════════════════════════════════════
+---
+
+## Iteration Pattern
+
+```
+Initial plan → Commit → STOP
+Refine plan → Commit → STOP (repeat as needed)
+Plan ready → Commit → STOP
+Task 1 → Commit → STOP
+Task 2 → Commit → STOP
+Task N → Commit → STOP → COMPLETE
+```
+
+Check `PROGRESS.md` to determine your current phase.

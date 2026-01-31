@@ -1472,6 +1472,7 @@ Examples:
     parser.add_argument('--model', choices=['opus', 'sonnet', 'haiku'], default='opus', help='Model to use for Claude CLI (default: opus)')
     parser.add_argument('--cli-type', choices=['claude', 'codex'], default='claude', help='Which CLI to use (default: claude)')
     parser.add_argument('--timeout', type=int, default=600, help='Timeout in seconds for each iteration (default: 600 = 10 minutes)')
+    parser.add_argument('--timeout-total', type=int, default=None, help='Total timeout in seconds for entire ralph loop (default: None = no limit)')
     parser.add_argument('--log-file', type=str, default=None, help='Path to log file (default: /tmp/ralph_[work-dir-basename]_[timestamp]_iteration.log)')
     parser.add_argument('--outer-prompt', type=str, default=None, help='Path to outer prompt template file (default: ~/.ralph/prompts/outer-prompt-default.md)')
     parser.add_argument('--system-prompt', type=str, default=None, help='System prompt to pass to Claude CLI')
@@ -1627,6 +1628,8 @@ def main() -> int:
         print(f"Max iterations: {args.max_iterations}")
         print(f"Max turns per iteration: {args.max_turns}")
         print(f"Timeout per iteration: {args.timeout} seconds")
+        if args.timeout_total:
+            print(f"Total timeout: {args.timeout_total} seconds")
         print(f"CLI: {args.cli_type}")
 
         if args.cli_type == 'claude':
@@ -1660,7 +1663,10 @@ def main() -> int:
 
         write_log_box_line(log_file, f"Task: {args.prompt[:55]}{'...' if len(args.prompt) > 55 else ''}")
         write_log_box_line(log_file, f"Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        write_log_box_line(log_file, f"Max iterations: {args.max_iterations} | Max turns: {args.max_turns} | Timeout: {args.timeout}s")
+        timeout_str = f"Max iterations: {args.max_iterations} | Max turns: {args.max_turns} | Timeout: {args.timeout}s"
+        if args.timeout_total:
+            timeout_str += f" | Total timeout: {args.timeout_total}s"
+        write_log_box_line(log_file, timeout_str)
         write_log_box_line(log_file, f"CLI: {args.cli_type}")
 
         if args.cli_type == 'claude':
@@ -1683,6 +1689,28 @@ def main() -> int:
         cumulative_output_tokens = 0
 
         for iteration in range(1, args.max_iterations + 1):
+            # Check total timeout before starting iteration
+            if args.timeout_total:
+                elapsed_seconds = (datetime.now() - start_time).total_seconds()
+                if elapsed_seconds >= args.timeout_total:
+                    print(f"\n{separator}")
+                    print(f"⏱️  TOTAL TIMEOUT REACHED")
+                    print(separator)
+                    print(f"Ralph loop exceeded total timeout of {args.timeout_total} seconds")
+                    print(f"Elapsed: {elapsed_seconds:.1f}s")
+                    print(separator)
+
+                    # Write to log
+                    write_to_log(log_file, f"\n{chr(10060)} TOTAL TIMEOUT REACHED\n")
+                    write_to_log(log_file, f"Exceeded timeout of {args.timeout_total}s (elapsed: {elapsed_seconds:.1f}s)\n")
+
+                    # Print summary and return error code
+                    print_final_summary(start_time, iteration - 1, args.max_iterations,
+                                      cumulative_input_tokens, cumulative_output_tokens, args.log_file)
+                    write_run_summary(log_file, args, start_time, iteration - 1,
+                                    cumulative_input_tokens, cumulative_output_tokens)
+                    return 2  # Return non-zero exit code for timeout
+
             print(f"\n🔄 Iteration {iteration}/{args.max_iterations}")
             print(f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             print("-" * 60)
