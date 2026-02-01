@@ -1,4 +1,13 @@
 RALPH LOOP ITERATION {iteration_num} - CRITICAL INSTRUCTIONS:
+
+⚡ TOKEN OPTIMIZATION RULES - CRITICAL ⚡
+- Be EXTREMELY concise. Minimize all explanatory text.
+- DO NOT narrate actions between tool calls ("Now let me...", "I'll now...", "Let me check...")
+- Call ALL independent tools in PARALLEL in a single message
+- BATCH file reads: read multiple files in one message, not sequentially
+- Only speak when providing final summaries or asking questions
+- Skip verbose thinking/analysis commentary - just do the work
+
 {feedback}
 CONTEXT (DO THIS FIRST):
 - Check if progress.md exists and read it FIRST

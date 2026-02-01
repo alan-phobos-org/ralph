@@ -41,6 +41,46 @@ Forced constraints:
 
 User manages all git operations. Focus on code changes only.
 
+## Token Optimization
+
+**Problem:** Initial implementations generated excessive output tokens due to verbose agent commentary.
+
+**Example from real run:**
+- Iteration 1: 83,057 output tokens (Opus model)
+- Iteration 2: 22,267 output tokens
+- Total: 105,324 tokens for simple code review
+
+**Root causes:**
+1. Verbose conversational output between tool calls ("Now let me...", "I'll check...")
+2. Extensive thinking/analysis commentary visible in output
+3. Sequential file reads with narration between each
+4. Model explaining every action instead of just doing work
+
+**Solutions implemented:**
+
+**1. Modified system prompts** (outer-prompt-concise.md, outer-prompt-default.md):
+```
+⚡ TOKEN OPTIMIZATION RULES - CRITICAL ⚡
+- Be EXTREMELY concise. Minimize all explanatory text.
+- DO NOT narrate actions between tool calls
+- Call ALL independent tools in PARALLEL in a single message
+- BATCH file reads: read multiple files in one message, not sequentially
+- Only speak when providing final summaries or asking questions
+- Skip verbose thinking/analysis commentary - just do the work
+```
+
+**2. Parallel tool execution guidance:**
+- Prompts explicitly instruct agent to batch independent operations
+- Read multiple files at once, not sequentially
+- Call tools in parallel whenever possible
+
+**3. Brevity enforcement:**
+- Critical placement at top of system prompt
+- Explicit examples of what NOT to do
+- Focus on action over explanation
+
+**Expected reduction:** 60-80% fewer output tokens for typical tasks by eliminating unnecessary narration.
+
 ## Logging & Output Status
 
 **Goal:** Clean human-readable console + comprehensive detailed log file

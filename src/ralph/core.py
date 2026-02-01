@@ -7,13 +7,16 @@ Progress persists in files and git, not context.
 
 import argparse
 import difflib
+import hashlib
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
 import time
+import traceback
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -1181,9 +1184,26 @@ def run_claude_iteration(
     max_turns: int = 50,
     timeout: int = 600,
     log_file: Optional[TextIO] = None,
-    system_prompt: Optional[str] = None
+    system_prompt: Optional[str] = None,
+    use_system_prompt_cache: bool = False,
+    outer_prompt_template: Optional[str] = None
 ) -> IterationResult:
-    """Run one iteration using Claude Code CLI."""
+    """
+    Run one iteration using Claude Code CLI.
+
+    Args:
+        prompt: User prompt (either wrapped or minimal depending on use_system_prompt_cache)
+        model: Model name (opus, sonnet, haiku)
+        max_turns: Maximum turns per iteration
+        timeout: Timeout in seconds
+        log_file: Log file handle
+        system_prompt: Additional system prompt content
+        use_system_prompt_cache: If True, use outer template as system prompt for caching
+        outer_prompt_template: Outer template content (required if use_system_prompt_cache=True)
+
+    Returns:
+        IterationResult with execution details
+    """
     cmd = [
         'claude',
         '--print',
@@ -1194,8 +1214,21 @@ def run_claude_iteration(
         '--verbose'
     ]
 
-    if system_prompt:
-        cmd.extend(['--system-prompt', system_prompt])
+    # Compose system prompt
+    final_system_prompt = None
+
+    if use_system_prompt_cache and outer_prompt_template:
+        # Use outer template as system prompt for caching
+        final_system_prompt = outer_prompt_template
+        if system_prompt:
+            # Append custom system prompt
+            final_system_prompt = f"{outer_prompt_template}\n\n{system_prompt}"
+    elif system_prompt:
+        # Use custom system prompt only
+        final_system_prompt = system_prompt
+
+    if final_system_prompt:
+        cmd.extend(['--system-prompt', final_system_prompt])
 
     cmd.extend(['-p', prompt])
 
@@ -1283,38 +1316,28 @@ def extract_iteration_feedback(result: IterationResult) -> str:
 
     if result.compaction_detected:
         feedback_parts.append(
-            "⚠️ PREVIOUS ITERATION DETECTED CONVERSATION COMPACTION\n"
-            "The last iteration was stopped early because Claude was about to compact the conversation.\n"
-            "This indicates the context window was getting full.\n"
-            "GUIDANCE: The iteration was terminated to preserve context. Continue with the next task."
+            "⚠️ COMPACTION_DETECTED: Context window filling, iteration terminated early. Continue with next task."
         )
 
     if result.max_turns_reached:
         feedback_parts.append(
-            "⚠️ PREVIOUS ITERATION HIT MAX TURNS LIMIT\n"
-            "The last iteration was stopped because it reached the maximum turn limit.\n"
-            "This usually means the plan has tasks that are too large or complex.\n"
-            "GUIDANCE: Break down the current task into smaller, more focused steps."
+            "⚠️ MAX_TURNS_HIT: Current task too complex. Break it into smaller subtasks."
         )
 
     if result.timeout_occurred:
         feedback_parts.append(
-            "⚠️ PREVIOUS ITERATION TIMED OUT\n"
-            "The last iteration exceeded the time limit.\n"
-            "GUIDANCE: Simplify the current task or break it into smaller pieces."
+            "⚠️ TIMEOUT: Task too large. Simplify or split into smaller pieces."
         )
 
     if result.error and not (result.max_turns_reached or result.timeout_occurred or result.compaction_detected):
         feedback_parts.append(
-            f"⚠️ PREVIOUS ITERATION ENCOUNTERED AN ERROR\n"
-            f"Error: {result.error[:500]}\n"
-            f"GUIDANCE: Address this error before proceeding."
+            f"⚠️ ERROR: {result.error[:200]}"
         )
 
     if not feedback_parts and result.success:
-        return "✅ Previous iteration completed successfully."
+        return "✅ Success"
 
-    return "\n\n".join(feedback_parts) if feedback_parts else "No feedback from previous iteration."
+    return "\n".join(feedback_parts) if feedback_parts else ""
 
 
 def check_for_commit(result: IterationResult) -> bool:
@@ -1332,6 +1355,19 @@ def check_for_commit(result: IterationResult) -> bool:
         return bool(log_result.stdout.strip())
     except Exception:
         return False
+
+
+def get_progress_file_hash() -> Optional[str]:
+    """Get hash of progress.md file if it exists."""
+    progress_file = Path('progress.md')
+    if not progress_file.exists():
+        return None
+
+    try:
+        content = progress_file.read_bytes()
+        return hashlib.sha256(content).hexdigest()
+    except Exception:
+        return None
 
 
 def check_completion(result: IterationResult) -> bool:
@@ -1359,19 +1395,44 @@ def create_wrapped_prompt(
     user_prompt: str,
     iteration_num: int,
     outer_prompt_template: str,
-    feedback: Optional[str] = None
+    feedback: Optional[str] = None,
+    use_system_prompt: bool = False
 ) -> str:
-    """Wrap user prompt with Ralph Loop instructions from template."""
-    feedback_section = ""
-    if feedback and iteration_num > 1:
-        separator = "=" * 60
-        feedback_section = f"\n\n{separator}\nFEEDBACK FROM PREVIOUS ITERATION:\n{separator}\n{feedback}\n{separator}\n"
+    """
+    Create prompt for iteration.
 
-    return outer_prompt_template.format(
-        iteration_num=iteration_num,
-        user_prompt=user_prompt,
-        feedback=feedback_section
-    )
+    Args:
+        user_prompt: The user's task
+        iteration_num: Current iteration number
+        outer_prompt_template: Template with workflow instructions
+        feedback: Feedback from previous iteration
+        use_system_prompt: If True, return minimal user prompt (template goes to system prompt)
+
+    Returns:
+        Formatted prompt string
+    """
+    if use_system_prompt:
+        # Minimal user prompt - system prompt contains template
+        parts = [f"ITERATION: {iteration_num}"]
+
+        if feedback and iteration_num > 1:
+            parts.append(f"FEEDBACK: {feedback}")
+
+        parts.append(f"TASK:\n{user_prompt}")
+
+        return "\n\n".join(parts)
+    else:
+        # Legacy mode - full wrapped prompt
+        feedback_section = ""
+        if feedback and iteration_num > 1:
+            separator = "=" * 60
+            feedback_section = f"\n\n{separator}\nFEEDBACK FROM PREVIOUS ITERATION:\n{separator}\n{feedback}\n{separator}\n"
+
+        return outer_prompt_template.format(
+            iteration_num=iteration_num,
+            user_prompt=user_prompt,
+            feedback=feedback_section
+        )
 
 
 def install_user_prompts(force: bool = False) -> None:
@@ -1406,6 +1467,20 @@ def get_default_outer_prompt_path() -> Path:
     if not user_prompts.exists():
         raise FileNotFoundError(
             f"Could not find outer-prompt-default.md at {user_prompts}. "
+            "Run 'ralph --init' to reinstall default prompts."
+        )
+
+    return user_prompts
+
+
+def get_concise_outer_prompt_path() -> Path:
+    """Get concise outer prompt for system-prompt-cache mode."""
+    ensure_prompts_installed()
+    user_prompts = Path.home() / '.ralph' / 'prompts' / 'outer-prompt-concise.md'
+
+    if not user_prompts.exists():
+        raise FileNotFoundError(
+            f"Could not find outer-prompt-concise.md at {user_prompts}. "
             "Run 'ralph --init' to reinstall default prompts."
         )
 
@@ -1476,7 +1551,10 @@ Examples:
     parser.add_argument('--log-file', type=str, default=None, help='Path to log file (default: /tmp/ralph_[work-dir-basename]_[timestamp]_iteration.log)')
     parser.add_argument('--outer-prompt', type=str, default=None, help='Path to outer prompt template file (default: ~/.ralph/prompts/outer-prompt-default.md)')
     parser.add_argument('--system-prompt', type=str, default=None, help='System prompt to pass to Claude CLI')
+    parser.add_argument('--use-system-prompt-cache', action='store_true', default=True, help='Use system prompt for caching outer template (default: True, reduces token usage by ~85%%)')
+    parser.add_argument('--no-system-prompt-cache', dest='use_system_prompt_cache', action='store_false', help='Disable system prompt caching (legacy mode)')
     parser.add_argument('--init', action='store_true', help='Install default prompts to ~/.ralph/prompts/ for customization')
+    parser.add_argument('--detach', action='store_true', help='Fork Ralph to run in background, exit immediately')
     parser.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
 
     return parser
@@ -1589,9 +1667,67 @@ def main() -> int:
         install_user_prompts(force=True)
         return 0
 
-    # Set default outer prompt path
+    # Handle detached mode: fork Ralph and exit immediately
+    if args.detach:
+        # Re-exec without --detach flag to avoid infinite fork loop
+        # Build command for detached process (remove --detach)
+        cmd = [sys.executable, __file__]
+        for arg in sys.argv[1:]:
+            if arg == '--detach':
+                continue
+            cmd.append(arg)
+
+        # Set log file if not provided
+        if args.log_file is None:
+            args.log_file = create_log_file_path()
+            cmd.extend(['--log-file', args.log_file])
+
+        # Spawn detached process with robust error handling
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True  # Fully detach from parent
+            )
+        except OSError as e:
+            print(f"❌ Failed to spawn detached Ralph process", file=sys.stderr)
+            print(f"   Error: {e}", file=sys.stderr)
+            print(f"   Command: {' '.join(cmd)}", file=sys.stderr)
+            return 1
+        except Exception as e:
+            print(f"❌ Unexpected error spawning detached process", file=sys.stderr)
+            print(f"   Error: {type(e).__name__}: {e}", file=sys.stderr)
+            print(f"   Command: {' '.join(cmd)}", file=sys.stderr)
+            return 1
+
+        # Verify process started successfully (check it didn't die immediately)
+        time.sleep(0.1)  # Brief delay to allow immediate failures to surface
+        exit_code = proc.poll()
+        if exit_code is not None:
+            print(f"❌ Detached Ralph process died immediately", file=sys.stderr)
+            print(f"   Exit code: {exit_code}", file=sys.stderr)
+            print(f"   Command: {' '.join(cmd)}", file=sys.stderr)
+            print(f"   Log file: {args.log_file}", file=sys.stderr)
+            print(f"\nCheck the log file for details: {args.log_file}", file=sys.stderr)
+            return 1
+
+        # Print info and exit immediately
+        print("🚀 Ralph started in detached mode")
+        print(f"  PID: {proc.pid}")
+        print(f"  Log file: {args.log_file}")
+        print(f"\nRalph is running in the background.")
+        print(f"Check progress: tail -f {args.log_file}")
+        print(f"Stop Ralph:     kill {proc.pid}")
+        return 0
+
+    # Set default outer prompt path based on cache mode
     if args.outer_prompt is None:
-        args.outer_prompt = str(get_default_outer_prompt_path())
+        if args.use_system_prompt_cache:
+            args.outer_prompt = str(get_concise_outer_prompt_path())
+        else:
+            args.outer_prompt = str(get_default_outer_prompt_path())
 
     # Load outer prompt template
     outer_prompt_template = load_outer_prompt(args.outer_prompt)
@@ -1619,6 +1755,7 @@ def main() -> int:
 
     log_file = open(args.log_file, 'w', encoding='utf-8')
     logger = TeeLogger(log_file)
+    detailed_logger = DetailedLogger(log_file)
 
     try:
         separator = "=" * 60
@@ -1634,16 +1771,37 @@ def main() -> int:
 
         if args.cli_type == 'claude':
             print(f"Model: {args.model}")
+            if args.use_system_prompt_cache:
+                print(f"System prompt caching: ENABLED (using concise template)")
+                template_tokens = estimate_tokens(outer_prompt_template)
+                print(f"  Template size: {template_tokens:,} tokens (cached per iteration)")
+            else:
+                print(f"System prompt caching: DISABLED (legacy mode)")
             if args.system_prompt:
-                print(f"System prompt: {args.system_prompt}")
+                print(f"Custom system prompt: {args.system_prompt[:50]}...")
 
         print(f"Human-in-the-loop: {args.human_in_the_loop}")
         print(separator)
 
         # Calculate and display initial token count
-        initial_prompt = create_wrapped_prompt(args.prompt, 1, outer_prompt_template, None)
+        initial_prompt = create_wrapped_prompt(
+            args.prompt,
+            1,
+            outer_prompt_template,
+            None,
+            use_system_prompt=args.use_system_prompt_cache
+        )
         initial_tokens = estimate_tokens(initial_prompt)
-        print(f"\n📊 Initial prompt size: {initial_tokens:,} tokens (estimated)")
+
+        if args.use_system_prompt_cache:
+            template_tokens = estimate_tokens(outer_prompt_template)
+            print(f"\n📊 Token usage (estimated):")
+            print(f"   User prompt: {initial_tokens:,} tokens (sent each iteration)")
+            print(f"   Template: {template_tokens:,} tokens (cached, sent once)")
+            print(f"   Total first iteration: {initial_tokens + template_tokens:,} tokens")
+            print(f"   Subsequent iterations: ~{initial_tokens:,} tokens (cache hit)")
+        else:
+            print(f"\n📊 Initial prompt size: {initial_tokens:,} tokens (estimated)")
         print(separator)
 
         # Print initial prompt once
@@ -1687,6 +1845,7 @@ def main() -> int:
         previous_prompt: Optional[str] = None
         cumulative_input_tokens = 0
         cumulative_output_tokens = 0
+        consecutive_unproductive = 0  # Track iterations without commits or progress changes
 
         for iteration in range(1, args.max_iterations + 1):
             # Check total timeout before starting iteration
@@ -1715,9 +1874,18 @@ def main() -> int:
             print(f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             print("-" * 60)
 
+            # Capture progress file state before iteration
+            progress_hash_before = get_progress_file_hash()
+
             # Extract feedback and create wrapped prompt
             feedback = extract_iteration_feedback(previous_result) if previous_result else None
-            wrapped_prompt = create_wrapped_prompt(args.prompt, iteration, outer_prompt_template, feedback)
+            wrapped_prompt = create_wrapped_prompt(
+                args.prompt,
+                iteration,
+                outer_prompt_template,
+                feedback,
+                use_system_prompt=args.use_system_prompt_cache
+            )
 
             # Log prompt with diff for iterations > 1
             if iteration == 1:
@@ -1761,7 +1929,16 @@ def main() -> int:
 
             # Run iteration
             if args.cli_type == 'claude':
-                result = run_claude_iteration(wrapped_prompt, args.model, args.max_turns, args.timeout, log_file, args.system_prompt)
+                result = run_claude_iteration(
+                    wrapped_prompt,
+                    args.model,
+                    args.max_turns,
+                    args.timeout,
+                    log_file,
+                    args.system_prompt,
+                    use_system_prompt_cache=args.use_system_prompt_cache,
+                    outer_prompt_template=outer_prompt_template if args.use_system_prompt_cache else None
+                )
             else:
                 result = run_codex_iteration(wrapped_prompt, args.timeout, log_file)
 
@@ -1817,6 +1994,34 @@ def main() -> int:
             # Log success
             write_to_log(log_file, f"\n✅ Iteration {iteration} completed successfully\n")
 
+            # Check for productivity (commits or progress file changes)
+            progress_hash_after = get_progress_file_hash()
+            has_commit = check_for_commit(result)
+            progress_changed = progress_hash_before != progress_hash_after
+
+            if has_commit or progress_changed:
+                # Productive iteration - reset counter
+                consecutive_unproductive = 0
+                if has_commit:
+                    write_to_log(log_file, f"✅ Commit detected in iteration {iteration}\n")
+                if progress_changed:
+                    write_to_log(log_file, f"✅ Progress file changed in iteration {iteration}\n")
+            else:
+                # Unproductive iteration - increment counter
+                consecutive_unproductive += 1
+                write_to_log(log_file, f"⚠️  No commit or progress change in iteration {iteration} (consecutive: {consecutive_unproductive}/3)\n")
+
+                if consecutive_unproductive >= 3:
+                    print(f"\n{separator}")
+                    print("🛑 STOPPING - Three consecutive unproductive iterations")
+                    print(separator)
+                    print("No git commits or progress file changes detected in last 3 successful iterations.")
+                    print("This suggests the loop is repeating work inefficiently.")
+                    print(separator)
+                    write_to_log(log_file, f"\n🛑 STOPPING - Three consecutive successful iterations without productivity\n")
+                    write_to_log(log_file, f"Last unproductive iteration: {iteration}\n")
+                    break
+
             # Check for completion signal
             if check_completion(result):
                 print(f"\n{separator}")
@@ -1824,8 +2029,8 @@ def main() -> int:
                 print(separator)
                 break
 
-            # Check for commit
-            if check_for_commit(result):
+            # Check for commit (legacy - keeping for message)
+            if has_commit:
                 print("✅ Commit detected - forcing exit to prevent overwork")
 
             # Human review
@@ -1845,6 +2050,19 @@ def main() -> int:
                          cumulative_input_tokens, cumulative_output_tokens)
 
         return 0
+
+    except KeyboardInterrupt:
+        # Handle Ctrl+C gracefully
+        print("\n\n⚠️  Interrupted by user", file=sys.stderr)
+        return 1
+
+    except Exception as e:
+        # Handle unexpected exceptions
+        print(f"\n\n❌ Fatal error: {e}", file=sys.stderr)
+        print(f"See log file for details: {args.log_file}", file=sys.stderr)
+        import traceback as tb
+        tb.print_exc()
+        return 1
 
     finally:
         logger.restore()
