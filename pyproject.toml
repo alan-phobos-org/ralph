@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ralph-loop"
-version = "0.1.0"
+version = "0.2.0"
 description = "Iterative AI agent execution with progress persistence"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -21,7 +21,10 @@ classifiers = [
     "Operating System :: MacOS :: MacOS X",
 ]
 
-dependencies = []  # Pure stdlib!
+dependencies = [
+    "tree-sitter>=0.20.0",
+    "tree-sitter-c>=0.20.0",
+]
 
 [project.optional-dependencies]
 dev = [
@@ -32,6 +35,7 @@ dev = [
 
 [project.scripts]
 ralph = "ralph.core:main"
+"get_definition.py" = "ralph.get_definition:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
