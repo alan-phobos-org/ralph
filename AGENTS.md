@@ -58,7 +58,7 @@ User manages all git operations. Focus on code changes only.
 
 **Solutions implemented:**
 
-**1. Modified system prompts** (outer-prompt-concise.md, outer-prompt-default.md):
+**1. Modified system prompt** (outer-prompt-concise.md):
 ```
 ⚡ TOKEN OPTIMIZATION RULES - CRITICAL ⚡
 - Be EXTREMELY concise. Minimize all explanatory text.

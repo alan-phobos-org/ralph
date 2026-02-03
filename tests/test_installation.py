@@ -37,7 +37,7 @@ def test_prompts_bundled_in_wheel(test_venv, built_wheel):
     result = subprocess.run(
         [str(test_venv["python"]), "-c",
          "from pathlib import Path; import ralph.core; "
-         "p = Path(ralph.core.__file__).parent / 'prompts' / 'outer-prompt-default.md'; "
+         "p = Path(ralph.core.__file__).parent / 'prompts' / 'outer-prompt-concise.md'; "
          "print(p.exists())"],
         capture_output=True,
         text=True,
@@ -62,7 +62,7 @@ def test_init_command(test_venv, built_wheel, tmp_path):
     )
 
     assert result.returncode == 0
-    assert (tmp_path / '.ralph' / 'prompts' / 'outer-prompt-default.md').exists()
+    assert (tmp_path / '.ralph' / 'prompts' / 'outer-prompt-concise.md').exists()
 
 
 @pytest.mark.installation

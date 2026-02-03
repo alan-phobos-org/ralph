@@ -1185,21 +1185,21 @@ def run_claude_iteration(
     timeout: int = 600,
     log_file: Optional[TextIO] = None,
     system_prompt: Optional[str] = None,
-    use_system_prompt_cache: bool = False,
+    use_system_prompt_cache: bool = True,
     outer_prompt_template: Optional[str] = None
 ) -> IterationResult:
     """
     Run one iteration using Claude Code CLI.
 
     Args:
-        prompt: User prompt (either wrapped or minimal depending on use_system_prompt_cache)
+        prompt: User prompt (minimal form)
         model: Model name (opus, sonnet, haiku)
         max_turns: Maximum turns per iteration
         timeout: Timeout in seconds
         log_file: Log file handle
         system_prompt: Additional system prompt content
-        use_system_prompt_cache: If True, use outer template as system prompt for caching
-        outer_prompt_template: Outer template content (required if use_system_prompt_cache=True)
+        use_system_prompt_cache: Use outer template as system prompt for caching (always True)
+        outer_prompt_template: Outer template content
 
     Returns:
         IterationResult with execution details
@@ -1459,20 +1459,6 @@ def ensure_prompts_installed() -> None:
         install_user_prompts(force=True)
 
 
-def get_default_outer_prompt_path() -> Path:
-    """Get default outer prompt, ensuring it's installed to ~/.ralph/prompts/."""
-    ensure_prompts_installed()
-    user_prompts = Path.home() / '.ralph' / 'prompts' / 'outer-prompt-default.md'
-
-    if not user_prompts.exists():
-        raise FileNotFoundError(
-            f"Could not find outer-prompt-default.md at {user_prompts}. "
-            "Run 'ralph --init' to reinstall default prompts."
-        )
-
-    return user_prompts
-
-
 def get_concise_outer_prompt_path() -> Path:
     """Get concise outer prompt for system-prompt-cache mode."""
     ensure_prompts_installed()
@@ -1549,10 +1535,8 @@ Examples:
     parser.add_argument('--timeout', type=int, default=600, help='Timeout in seconds for each iteration (default: 600 = 10 minutes)')
     parser.add_argument('--timeout-total', type=int, default=None, help='Total timeout in seconds for entire ralph loop (default: None = no limit)')
     parser.add_argument('--log-file', type=str, default=None, help='Path to log file (default: /tmp/ralph_[work-dir-basename]_[timestamp]_iteration.log)')
-    parser.add_argument('--outer-prompt', type=str, default=None, help='Path to outer prompt template file (default: ~/.ralph/prompts/outer-prompt-default.md)')
+    parser.add_argument('--outer-prompt', type=str, default=None, help='Path to outer prompt template file (default: ~/.ralph/prompts/outer-prompt-concise.md)')
     parser.add_argument('--system-prompt', type=str, default=None, help='System prompt to pass to Claude CLI')
-    parser.add_argument('--use-system-prompt-cache', action='store_true', default=True, help='Use system prompt for caching outer template (default: True, reduces token usage by ~85%%)')
-    parser.add_argument('--no-system-prompt-cache', dest='use_system_prompt_cache', action='store_false', help='Disable system prompt caching (legacy mode)')
     parser.add_argument('--init', action='store_true', help='Install default prompts to ~/.ralph/prompts/ for customization')
     parser.add_argument('--detach', action='store_true', help='Fork Ralph to run in background, exit immediately')
     parser.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
@@ -1722,12 +1706,9 @@ def main() -> int:
         print(f"Stop Ralph:     kill {proc.pid}")
         return 0
 
-    # Set default outer prompt path based on cache mode
+    # Set default outer prompt path
     if args.outer_prompt is None:
-        if args.use_system_prompt_cache:
-            args.outer_prompt = str(get_concise_outer_prompt_path())
-        else:
-            args.outer_prompt = str(get_default_outer_prompt_path())
+        args.outer_prompt = str(get_concise_outer_prompt_path())
 
     # Load outer prompt template
     outer_prompt_template = load_outer_prompt(args.outer_prompt)
@@ -1771,12 +1752,8 @@ def main() -> int:
 
         if args.cli_type == 'claude':
             print(f"Model: {args.model}")
-            if args.use_system_prompt_cache:
-                print(f"System prompt caching: ENABLED (using concise template)")
-                template_tokens = estimate_tokens(outer_prompt_template)
-                print(f"  Template size: {template_tokens:,} tokens (cached per iteration)")
-            else:
-                print(f"System prompt caching: DISABLED (legacy mode)")
+            template_tokens = estimate_tokens(outer_prompt_template)
+            print(f"Template size: {template_tokens:,} tokens (cached per iteration)")
             if args.system_prompt:
                 print(f"Custom system prompt: {args.system_prompt[:50]}...")
 
@@ -1789,19 +1766,16 @@ def main() -> int:
             1,
             outer_prompt_template,
             None,
-            use_system_prompt=args.use_system_prompt_cache
+            use_system_prompt=True
         )
         initial_tokens = estimate_tokens(initial_prompt)
+        template_tokens = estimate_tokens(outer_prompt_template)
 
-        if args.use_system_prompt_cache:
-            template_tokens = estimate_tokens(outer_prompt_template)
-            print(f"\n📊 Token usage (estimated):")
-            print(f"   User prompt: {initial_tokens:,} tokens (sent each iteration)")
-            print(f"   Template: {template_tokens:,} tokens (cached, sent once)")
-            print(f"   Total first iteration: {initial_tokens + template_tokens:,} tokens")
-            print(f"   Subsequent iterations: ~{initial_tokens:,} tokens (cache hit)")
-        else:
-            print(f"\n📊 Initial prompt size: {initial_tokens:,} tokens (estimated)")
+        print(f"\n📊 Token usage (estimated):")
+        print(f"   User prompt: {initial_tokens:,} tokens (sent each iteration)")
+        print(f"   Template: {template_tokens:,} tokens (cached, sent once)")
+        print(f"   Total first iteration: {initial_tokens + template_tokens:,} tokens")
+        print(f"   Subsequent iterations: ~{initial_tokens:,} tokens (cache hit)")
         print(separator)
 
         # Print initial prompt once
@@ -1884,7 +1858,7 @@ def main() -> int:
                 iteration,
                 outer_prompt_template,
                 feedback,
-                use_system_prompt=args.use_system_prompt_cache
+                use_system_prompt=True
             )
 
             # Log prompt with diff for iterations > 1
@@ -1936,8 +1910,8 @@ def main() -> int:
                     args.timeout,
                     log_file,
                     args.system_prompt,
-                    use_system_prompt_cache=args.use_system_prompt_cache,
-                    outer_prompt_template=outer_prompt_template if args.use_system_prompt_cache else None
+                    use_system_prompt_cache=True,
+                    outer_prompt_template=outer_prompt_template
                 )
             else:
                 result = run_codex_iteration(wrapped_prompt, args.timeout, log_file)

@@ -15,34 +15,24 @@ from ralph.core import (
     extract_iteration_feedback,
     estimate_tokens,
     get_concise_outer_prompt_path,
-    get_default_outer_prompt_path,
     IterationResult
 )
 
 
-def test_prompt_size_reduction():
-    """Test that concise template is smaller than default."""
-    print("Testing prompt template sizes...")
+def test_prompt_size_reasonable():
+    """Test that concise template is reasonably sized."""
+    print("Testing prompt template size...")
 
-    default_path = get_default_outer_prompt_path()
     concise_path = get_concise_outer_prompt_path()
-
-    default_template = default_path.read_text()
     concise_template = concise_path.read_text()
-
-    default_tokens = estimate_tokens(default_template)
     concise_tokens = estimate_tokens(concise_template)
 
-    print(f"  Default template: {len(default_template)} chars, ~{default_tokens} tokens")
     print(f"  Concise template: {len(concise_template)} chars, ~{concise_tokens} tokens")
 
-    reduction_pct = ((default_tokens - concise_tokens) / default_tokens) * 100
-    print(f"  Reduction: {reduction_pct:.1f}%")
+    # Verify template is not too large (should be under 2000 tokens)
+    assert concise_tokens < 2000, f"Template should be <2000 tokens, got {concise_tokens}"
 
-    assert concise_tokens < default_tokens, "Concise template should be smaller"
-    assert reduction_pct > 40, f"Should reduce by >40%, got {reduction_pct:.1f}%"
-
-    print("  ✓ Template size reduction verified\n")
+    print("  ✓ Template size verified\n")
 
 
 def test_feedback_compression():
@@ -147,20 +137,12 @@ def test_iteration_token_stability():
     print("  ✓ Token stability verified\n")
 
 
-def test_total_savings():
-    """Calculate total savings for a typical 10-iteration run."""
-    print("Calculating total savings for 10-iteration run...")
+def test_cache_mode_efficiency():
+    """Verify that system prompt cache mode is efficient over 10 iterations."""
+    print("Calculating efficiency for 10-iteration run with caching...")
 
-    default_template = get_default_outer_prompt_path().read_text()
     concise_template = get_concise_outer_prompt_path().read_text()
     user_task = "Implement complete feature with tests and documentation"
-
-    # Legacy mode (10 iterations)
-    legacy_total = 0
-    for i in range(1, 11):
-        feedback = "✅ Success" if i > 1 else None
-        prompt = create_wrapped_prompt(user_task, i, default_template, feedback, use_system_prompt=False)
-        legacy_total += estimate_tokens(prompt)
 
     # System prompt cache mode (10 iterations)
     # First iteration: template + user prompt (template cached)
@@ -173,16 +155,16 @@ def test_total_savings():
         prompt = create_wrapped_prompt(user_task, i, concise_template, feedback, use_system_prompt=True)
         cache_total += estimate_tokens(prompt)
 
-    savings = legacy_total - cache_total
-    savings_pct = (savings / legacy_total) * 100
+    avg_per_iteration = cache_total / 10
 
-    print(f"  Legacy mode (10 iterations): ~{legacy_total:,} input tokens")
-    print(f"  Cache mode (10 iterations):  ~{cache_total:,} input tokens")
-    print(f"  Savings: ~{savings:,} tokens ({savings_pct:.1f}%)")
+    print(f"  Template (cached once):      ~{template_tokens:,} tokens")
+    print(f"  Total (10 iterations):       ~{cache_total:,} input tokens")
+    print(f"  Average per iteration:       ~{avg_per_iteration:,.0f} tokens")
 
-    assert savings_pct > 75, f"Should save >75% tokens, got {savings_pct:.1f}%"
+    # Verify efficiency: average per iteration should be reasonable
+    assert avg_per_iteration < 500, f"Average per iteration too high: {avg_per_iteration:.0f} tokens"
 
-    print("  ✓ Total savings verified\n")
+    print("  ✓ Cache mode efficiency verified\n")
 
 
 if __name__ == '__main__':
@@ -192,11 +174,11 @@ if __name__ == '__main__':
     print()
 
     try:
-        test_prompt_size_reduction()
+        test_prompt_size_reasonable()
         test_feedback_compression()
         test_system_prompt_mode()
         test_iteration_token_stability()
-        test_total_savings()
+        test_cache_mode_efficiency()
 
         print("=" * 60)
         print("✅ ALL TESTS PASSED")
