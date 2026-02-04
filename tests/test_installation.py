@@ -47,25 +47,6 @@ def test_prompts_bundled_in_wheel(test_venv, built_wheel):
 
 
 @pytest.mark.installation
-def test_init_command(test_venv, built_wheel, tmp_path):
-    """Verify --init installs prompts to user directory."""
-    subprocess.run([str(test_venv["pip"]), "install", str(built_wheel)], check=True)
-
-    env = os.environ.copy()
-    env["HOME"] = str(tmp_path)
-
-    result = subprocess.run(
-        [str(test_venv["python"]), "-m", "ralph", "--init"],
-        capture_output=True,
-        text=True,
-        env=env
-    )
-
-    assert result.returncode == 0
-    assert (tmp_path / '.ralph' / 'prompts' / 'outer-prompt-concise.md').exists()
-
-
-@pytest.mark.installation
 def test_version_accessible(test_venv, built_wheel):
     """Verify package version is accessible."""
     subprocess.run([str(test_venv["pip"]), "install", str(built_wheel)], check=True)

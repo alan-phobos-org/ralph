@@ -1435,42 +1435,17 @@ def create_wrapped_prompt(
         )
 
 
-def install_user_prompts(force: bool = False) -> None:
-    """Copy default prompts from package to ~/.ralph/prompts/."""
-    user_prompts_dir = Path.home() / '.ralph' / 'prompts'
-    package_prompts_dir = Path(__file__).parent / 'prompts'
-
-    if user_prompts_dir.exists() and not force:
-        return  # Already installed
-
-    user_prompts_dir.mkdir(parents=True, exist_ok=True)
-
-    for prompt_file in package_prompts_dir.glob('*.md'):
-        dest = user_prompts_dir / prompt_file.name
-        dest.write_text(prompt_file.read_text(encoding='utf-8'))
-
-    print(f"✓ Initialized prompts to {user_prompts_dir}")
-
-
-def ensure_prompts_installed() -> None:
-    """Auto-install prompts to ~/.ralph/prompts/ if not already present."""
-    user_prompts_dir = Path.home() / '.ralph' / 'prompts'
-    if not user_prompts_dir.exists():
-        install_user_prompts(force=True)
-
-
 def get_concise_outer_prompt_path() -> Path:
-    """Get concise outer prompt for system-prompt-cache mode."""
-    ensure_prompts_installed()
-    user_prompts = Path.home() / '.ralph' / 'prompts' / 'outer-prompt-concise.md'
+    """Get concise outer prompt for system-prompt-cache mode from package."""
+    package_prompts_dir = Path(__file__).parent / 'prompts'
+    prompt_path = package_prompts_dir / 'outer-prompt-concise.md'
 
-    if not user_prompts.exists():
+    if not prompt_path.exists():
         raise FileNotFoundError(
-            f"Could not find outer-prompt-concise.md at {user_prompts}. "
-            "Run 'ralph --init' to reinstall default prompts."
+            f"Could not find outer-prompt-concise.md in package at {prompt_path}"
         )
 
-    return user_prompts
+    return prompt_path
 
 
 # ============================================================================
@@ -1535,9 +1510,8 @@ Examples:
     parser.add_argument('--timeout', type=int, default=600, help='Timeout in seconds for each iteration (default: 600 = 10 minutes)')
     parser.add_argument('--timeout-total', type=int, default=None, help='Total timeout in seconds for entire ralph loop (default: None = no limit)')
     parser.add_argument('--log-file', type=str, default=None, help='Path to log file (default: /tmp/ralph_[work-dir-basename]_[timestamp]_iteration.log)')
-    parser.add_argument('--outer-prompt', type=str, default=None, help='Path to outer prompt template file (default: ~/.ralph/prompts/outer-prompt-concise.md)')
+    parser.add_argument('--outer-prompt', type=str, default=None, help='Path to outer prompt template file (default: package bundled outer-prompt-concise.md)')
     parser.add_argument('--system-prompt', type=str, default=None, help='System prompt to pass to Claude CLI')
-    parser.add_argument('--init', action='store_true', help='Install default prompts to ~/.ralph/prompts/ for customization')
     parser.add_argument('--detach', action='store_true', help='Fork Ralph to run in background, exit immediately')
     parser.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
 
@@ -1645,11 +1619,6 @@ def main() -> int:
     """Main entry point for Ralph Loop."""
     parser = setup_argument_parser()
     args = parser.parse_args()
-
-    # Handle init command
-    if args.init:
-        install_user_prompts(force=True)
-        return 0
 
     # Handle detached mode: fork Ralph and exit immediately
     if args.detach:

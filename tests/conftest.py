@@ -37,7 +37,7 @@ def built_wheel(tmp_path_factory):
     build_dir = tmp_path_factory.mktemp("build")
 
     subprocess.run(
-        ["python", "-m", "build", "--wheel", "--outdir", str(build_dir)],
+        [sys.executable, "-m", "build", "--wheel", "--outdir", str(build_dir)],
         cwd=project_root,
         capture_output=True,
         check=True

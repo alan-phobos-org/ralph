@@ -1,7 +1,7 @@
-"""Tests for prompt loading and installation."""
+"""Tests for prompt loading from package."""
 import pytest
 from pathlib import Path
-from ralph.core import get_concise_outer_prompt_path, install_user_prompts
+from ralph.core import get_concise_outer_prompt_path
 
 
 def test_package_prompts_bundled():
@@ -12,17 +12,18 @@ def test_package_prompts_bundled():
     assert prompt_path.read_text()
 
 
-def test_install_user_prompts(isolated_home):
-    """Test installing prompts to ~/.ralph/prompts/."""
-    install_user_prompts(force=True)
-
-    user_prompts = isolated_home / '.ralph' / 'prompts'
-    assert user_prompts.exists()
-    assert (user_prompts / 'outer-prompt-concise.md').exists()
-
-
-def test_get_concise_prompt_auto_install(isolated_home):
-    """Test auto-installation when ~/.ralph/ doesn't exist."""
+def test_get_concise_prompt_from_package():
+    """Test loading concise prompt from package."""
     prompt_path = get_concise_outer_prompt_path()
     assert prompt_path.exists()
-    assert (isolated_home / '.ralph' / 'prompts').exists()
+    assert prompt_path.is_file()
+
+    # Verify it's the package prompt, not a user-installed one
+    from ralph import core
+    expected_path = Path(core.__file__).parent / 'prompts' / 'outer-prompt-concise.md'
+    assert prompt_path == expected_path
+
+    # Verify content is readable
+    content = prompt_path.read_text()
+    assert len(content) > 0
+    assert 'RALPH' in content or 'ralph' in content  # Should contain reference to Ralph
