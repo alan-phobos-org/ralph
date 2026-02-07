@@ -50,14 +50,17 @@ ralph "Implement user authentication" --max-iterations 20
 # Read prompt from file
 ralph -f task.md --max-iterations 10
 
-# Use different models
+# Use different Claude models
 ralph "Run tests" --model haiku --max-iterations 5
 ralph "Build feature" --model sonnet --max-iterations 15
+
+# Use Codex CLI (defaults: gpt-5.3-codex + xhigh reasoning)
+ralph "Fix failing tests" --cli-type codex --max-iterations 10
 
 # Human-in-the-loop mode (pause after each iteration)
 ralph "Complex refactor" --human-in-the-loop --max-iterations 30
 
-# Custom system prompt
+# Custom stable instructions (Claude: system prompt; Codex: developer instructions)
 ralph "Task" --system-prompt "You are an expert Python developer"
 ```
 
@@ -78,11 +81,16 @@ Default prompts are installed to `~/.ralph/prompts/` and can be customized.
 - `--max-iterations N`: Maximum number of iterations (default: 10)
 - `--max-turns N`: Maximum turns per iteration (default: 50)
 - `--timeout N`: Timeout in seconds per iteration (default: 600)
-- `--model {opus,sonnet,haiku}`: Model to use (default: opus)
+- `--cli-type {claude,codex}`: Which CLI backend to use (default: claude)
+- `--model {opus,sonnet,haiku}`: Claude model to use (default: opus)
+- `--codex-model MODEL`: Codex model to use (default: gpt-5.3-codex)
+- `--codex-reasoning-effort {low,medium,high,xhigh}`: Codex reasoning effort (default: xhigh)
+- `--codex-sandbox {read-only,workspace-write,danger-full-access}`: Codex sandbox policy (default: danger-full-access)
+- `--codex-approval-policy {untrusted,on-failure,on-request,never}`: Codex approval policy (default: never)
 - `--human-in-the-loop`: Pause after each iteration for review
 - `--log-file PATH`: Custom log file path
 - `--outer-prompt PATH`: Custom outer prompt template
-- `--system-prompt TEXT`: Custom system prompt
+- `--system-prompt TEXT`: Extra stable instructions appended to the outer prompt + task
 
 ## How It Works
 
@@ -105,7 +113,7 @@ The agent receives a wrapped prompt with mandatory workflow:
 
 - Python 3.9+
 - Git repository (must be in a git repo to use ralph)
-- Claude CLI or compatible AI CLI
+- Claude CLI or Codex CLI
 
 ## Development
 

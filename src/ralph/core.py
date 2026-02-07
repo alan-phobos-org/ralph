@@ -31,8 +31,13 @@ except (ImportError, PackageNotFoundError):
     __version__ = "0.1.0"  # fallback for development
 
 # ============================================================================
-# CONSTANTS
+# CONSTANTS AND GLOBAL STATE
 # ============================================================================
+
+# Thread synchronization for log file writes
+_log_lock = threading.Lock()
+# Thread synchronization for console writes
+_console_lock = threading.Lock()
 
 # Display and formatting
 SECTION_WIDTH = 80
@@ -46,7 +51,6 @@ BASH_OUTPUT_PREVIEW = 64
 PATTERN_PREVIEW = 50
 
 # Threading and timing
-HEARTBEAT_INTERVAL = 30
 POLL_INTERVAL = 0.1
 THREAD_JOIN_TIMEOUT = 2
 
@@ -109,8 +113,9 @@ BOX_RIGHT_TEE_LIGHT_HEAVY = '┤'
 
 def console_print(message: str) -> None:
     """Print to console only (not to log file), bypassing TeeLogger."""
-    sys.__stdout__.write(message + '\n')
-    sys.__stdout__.flush()
+    with _console_lock:
+        sys.__stdout__.write(message + '\n')
+        sys.__stdout__.flush()
 
 
 def get_tool_emoji(tool_name: str) -> str:
@@ -148,6 +153,42 @@ def estimate_tokens(text: str) -> int:
     For accurate counting, use tiktoken or anthropic SDK.
     """
     return len(text) // 4
+
+
+def render_outer_prompt_template(template: str, max_turns: int, timeout_seconds: int) -> str:
+    """Render outer prompt template placeholders."""
+    return (
+        template.replace('{max_turns}', str(max_turns))
+        .replace('{timeout_seconds}', str(timeout_seconds))
+    )
+
+
+def compose_stable_instructions(
+    *,
+    outer_prompt_template: Optional[str],
+    task_prompt: Optional[str],
+    system_prompt: Optional[str],
+    max_turns: int,
+    timeout_seconds: int,
+) -> Optional[str]:
+    """
+    Compose stable instructions that should be cached across iterations.
+
+    Claude: passed via `--system-prompt`.
+    Codex: passed via `-c developer_instructions=...`.
+    """
+    parts: list[str] = []
+
+    if outer_prompt_template:
+        parts.append(render_outer_prompt_template(outer_prompt_template, max_turns, timeout_seconds))
+
+    if task_prompt:
+        parts.append(f"TASK:\n{task_prompt}")
+
+    if system_prompt:
+        parts.append(system_prompt)
+
+    return "\n\n".join(parts) if parts else None
 
 
 def compute_prompt_diff(old_prompt: str, new_prompt: str) -> tuple[list[str], int]:
@@ -200,10 +241,11 @@ def create_log_file_path() -> str:
 # ============================================================================
 
 def write_to_log(log_file: TextIO, text: str, flush: bool = True) -> None:
-    """Write text to log file and optionally flush."""
-    log_file.write(text)
-    if flush:
-        log_file.flush()
+    """Write text to log file and optionally flush. Thread-safe."""
+    with _log_lock:
+        log_file.write(text)
+        if flush:
+            log_file.flush()
 
 
 def write_log_box_header(log_file: TextIO, title: str, width: int = SECTION_WIDTH) -> None:
@@ -418,13 +460,17 @@ def handle_tool_invocation(
     """
     tool_input_json = json.dumps(tool_input, indent=2)
 
-    # Write to log file with box-drawing formatting
-    write_to_log(log_file, f"\n[{timestamp}] TOOL INVOKED: {tool_name}\n")
-    write_to_log(log_file, f"{BOX_TOP_LEFT_LIGHT}{BOX_HORIZONTAL_LIGHT} Input {BOX_HORIZONTAL_LIGHT * 40}\n")
+    # Write to log file with box-drawing formatting as a single block
+    log_lines = [
+        f"\n[{timestamp}] TOOL INVOKED: {tool_name}\n",
+        f"{BOX_TOP_LEFT_LIGHT}{BOX_HORIZONTAL_LIGHT} Input {BOX_HORIZONTAL_LIGHT * 40}\n",
+    ]
 
     # Indent the JSON input
     for line in tool_input_json.split('\n'):
-        write_to_log(log_file, f"{BOX_VERTICAL_LIGHT} {line}\n")
+        log_lines.append(f"{BOX_VERTICAL_LIGHT} {line}\n")
+
+    write_to_log(log_file, ''.join(log_lines))
 
     # Store invocation time for duration calculation
     tool_map[tool_id] = {
@@ -468,27 +514,32 @@ def handle_tool_result(
         else:
             result_preview = result_content
 
-        # Write to log file with box completion
-        write_to_log(log_file, f"{BOX_LEFT_TEE_LIGHT_HEAVY}{BOX_HORIZONTAL_LIGHT} Result [{duration_str}] {BOX_HORIZONTAL_LIGHT * 20}\n")
+        # Write to log file with box completion as a single block
+        log_lines = [
+            f"{BOX_LEFT_TEE_LIGHT_HEAVY}{BOX_HORIZONTAL_LIGHT} Result [{duration_str}] {BOX_HORIZONTAL_LIGHT * 20}\n"
+        ]
 
         # Write result content
         if is_error:
-            write_to_log(log_file, f"{BOX_VERTICAL_LIGHT} {chr(10006)} ERROR: {result_preview}\n")
+            log_lines.append(f"{BOX_VERTICAL_LIGHT} {chr(10006)} ERROR: {result_preview}\n")
         else:
             # Write result lines
             for line in result_preview.split('\n')[:10]:  # Show first 10 lines
-                write_to_log(log_file, f"{BOX_VERTICAL_LIGHT} {line}\n")
+                log_lines.append(f"{BOX_VERTICAL_LIGHT} {line}\n")
             if result_preview.count('\n') > 10:
                 remaining_lines = result_preview.count('\n') - 10
-                write_to_log(log_file, f"{BOX_VERTICAL_LIGHT}   [... {remaining_lines} more lines ...]\n")
+                log_lines.append(f"{BOX_VERTICAL_LIGHT}   [... {remaining_lines} more lines ...]\n")
 
-        write_to_log(log_file, f"{BOX_BOTTOM_LEFT_LIGHT}{BOX_HORIZONTAL_LIGHT * 44}{BOX_BOTTOM_RIGHT_LIGHT}\n")
+        log_lines.append(f"{BOX_BOTTOM_LEFT_LIGHT}{BOX_HORIZONTAL_LIGHT * 44}{BOX_BOTTOM_RIGHT_LIGHT}\n")
+        write_to_log(log_file, ''.join(log_lines))
 
-        # Print result paired with original tool invocation
+        # Print result paired with original tool invocation as a single block
         tool_summary = tool_info.get('summary', '')
-        console_print(tool_summary)
         formatted_result = format_tool_result(result_content, is_error, tool_summary)
-        console_print(formatted_result)
+        if tool_summary:
+            console_print(f"{tool_summary}\n{formatted_result}")
+        else:
+            console_print(formatted_result)
 
         # Remove from map to avoid duplicate printing
         del tool_map[tool_id]
@@ -523,8 +574,10 @@ def handle_final_result(json_obj: dict, timestamp: str, log_file: TextIO) -> Non
 
     # Print to console
     duration_sec = duration_ms / 1000
-    console_print(f"\n--- Iteration Complete: {subtype} ---")
-    console_print(f"Duration: {duration_sec:.1f}s | Turns: {num_turns}")
+    console_print(
+        f"\n--- Iteration Complete: {subtype} ---\n"
+        f"Duration: {duration_sec:.1f}s | Turns: {num_turns}"
+    )
 
 
 # ============================================================================
@@ -542,15 +595,20 @@ class TeeLogger:
         sys.stderr = self
 
     def write(self, message: str) -> None:
-        """Write to both console and log file."""
-        self.stdout.write(message)
-        self.log_file.write(message)
-        self.log_file.flush()
+        """Write to both console and log file. Thread-safe."""
+        with _console_lock:
+            self.stdout.write(message)
+            self.stdout.flush()
+        with _log_lock:
+            self.log_file.write(message)
+            self.log_file.flush()
 
     def flush(self) -> None:
-        """Flush both outputs."""
-        self.stdout.flush()
-        self.log_file.flush()
+        """Flush both outputs. Thread-safe."""
+        with _console_lock:
+            self.stdout.flush()
+        with _log_lock:
+            self.log_file.flush()
 
     def restore(self) -> None:
         """Restore original stdout/stderr."""
@@ -678,7 +736,7 @@ def stream_output_reader(
     logger: DetailedLogger,
     timestamped_list: Optional[list] = None,
     compaction_event: Optional[threading.Event] = None,
-    log_file: Optional[TextIO] = None
+    log_file: Optional[TextIO] = None,
 ) -> None:
     """
     Read from pipe and append to output_list, logging with timestamps.
@@ -721,39 +779,12 @@ def stream_output_reader(
         logger.log_event("ERROR", f"STREAM_READ_ERROR - Error reading {stream_name}: {e}")
 
 
-def heartbeat_monitor(
-    process,
-    logger: DetailedLogger,
-    interval: int = HEARTBEAT_INTERVAL,
-    stop_event: Optional[threading.Event] = None
-) -> None:
-    """
-    Monitor subprocess and log heartbeat to detect hangs.
-
-    Args:
-        process: Process to monitor
-        logger: Logger instance
-        interval: Heartbeat interval in seconds
-        stop_event: Event to signal stop
-    """
-    iteration = 0
-    while not stop_event.is_set():
-        iteration += 1
-        if process.poll() is None:
-            logger.log_event("HEARTBEAT", f"Process still running (check #{iteration})")
-        else:
-            logger.log_event("HEARTBEAT", "Process completed, stopping heartbeat")
-            break
-
-        stop_event.wait(interval)
-
-
 # ============================================================================
 # SUBPROCESS MANAGEMENT
 # ============================================================================
 
 class StreamingSubprocess:
-    """Context manager for subprocess with streaming output capture and heartbeat monitoring."""
+    """Context manager for subprocess with streaming output capture."""
 
     def __init__(
         self,
@@ -772,9 +803,8 @@ class StreamingSubprocess:
         self.stdout_lines: list = []
         self.stderr_lines: list = []
         self.timestamped_stdout: list = []
-        self.stop_event = threading.Event()
         self.compaction_event = threading.Event()
-        self.threads: list = []
+        self.reader_threads: list = []
 
     def __enter__(self):
         """Start subprocess and monitoring threads."""
@@ -787,7 +817,7 @@ class StreamingSubprocess:
             bufsize=1  # Line buffered
         )
 
-        # Start reader and heartbeat threads
+        # Start reader threads
         stdout_thread = threading.Thread(
             target=stream_output_reader,
             args=(
@@ -812,24 +842,23 @@ class StreamingSubprocess:
                 None
             )
         )
-        heartbeat_thread = threading.Thread(
-            target=heartbeat_monitor,
-            args=(self.process, self.logger, HEARTBEAT_INTERVAL, self.stop_event)
-        )
 
-        for t in [stdout_thread, stderr_thread, heartbeat_thread]:
+        for t in [stdout_thread, stderr_thread]:
             t.daemon = True
             t.start()
 
-        self.threads = [stdout_thread, stderr_thread, heartbeat_thread]
+        self.reader_threads = [stdout_thread, stderr_thread]
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Clean up threads."""
-        self.stop_event.set()
-        for t in self.threads:
-            t.join(timeout=THREAD_JOIN_TIMEOUT)
+        self._drain_output_threads()
         return False
+
+    def _drain_output_threads(self) -> None:
+        """Wait briefly for output reader threads to finish."""
+        for t in self.reader_threads:
+            t.join(timeout=THREAD_JOIN_TIMEOUT)
 
     def wait_with_timeout(self) -> tuple[int, str, str, list, bool]:
         """
@@ -855,6 +884,7 @@ class StreamingSubprocess:
                     self.process.kill()
                     self.process.wait()
 
+                self._drain_output_threads()
                 stdout_text = ''.join(self.stdout_lines)
                 stderr_text = ''.join(self.stderr_lines)
                 return 0, stdout_text, stderr_text, self.timestamped_stdout, True
@@ -862,6 +892,7 @@ class StreamingSubprocess:
             # Check if process completed naturally
             returncode = self.process.poll()
             if returncode is not None:
+                self._drain_output_threads()
                 stdout_text = ''.join(self.stdout_lines)
                 stderr_text = ''.join(self.stderr_lines)
                 return returncode, stdout_text, stderr_text, self.timestamped_stdout, False
@@ -881,6 +912,7 @@ class StreamingSubprocess:
         """
         self.process.kill()
         self.process.wait()
+        self._drain_output_threads()
         stdout_text = ''.join(self.stdout_lines)
         stderr_text = ''.join(self.stderr_lines)
         compaction_detected = self.compaction_event.is_set()
@@ -1040,9 +1072,10 @@ def run_cli_iteration(
     Returns:
         IterationResult with execution details
     """
-    # Set YOLO mode environment
     env = os.environ.copy()
-    env['CLAUDE_CODE_YOLO'] = '1'
+    if cli_name == 'claude':
+        # Skip permission prompts for Claude Code.
+        env['CLAUDE_CODE_YOLO'] = '1'
 
     # Initialize logger
     logger = DetailedLogger(log_file) if log_file else None
@@ -1054,7 +1087,8 @@ def run_cli_iteration(
         if len(cmd_str) > 60:
             cmd_str = cmd_str[:60] + '...'
         write_log_box_line(log_file, f"Command: {cmd_str}")
-        write_log_box_line(log_file, f"Environment: CLAUDE_CODE_YOLO={env.get('CLAUDE_CODE_YOLO')}")
+        if cli_name == 'claude':
+            write_log_box_line(log_file, f"Environment: CLAUDE_CODE_YOLO={env.get('CLAUDE_CODE_YOLO')}")
         write_log_box_line(log_file, f"Timeout: {timeout}s | Prompt: {len(prompt)} chars")
         write_log_box_divider(log_file, 67, heavy=False)
         write_log_box_line(log_file, "Streaming Output (real-time)")
@@ -1185,21 +1219,21 @@ def run_claude_iteration(
     timeout: int = 600,
     log_file: Optional[TextIO] = None,
     system_prompt: Optional[str] = None,
-    use_system_prompt_cache: bool = True,
-    outer_prompt_template: Optional[str] = None
+    outer_prompt_template: Optional[str] = None,
+    task_prompt: Optional[str] = None
 ) -> IterationResult:
     """
     Run one iteration using Claude Code CLI.
 
     Args:
-        prompt: User prompt (minimal form)
+        prompt: User prompt (minimal iteration metadata only)
         model: Model name (opus, sonnet, haiku)
         max_turns: Maximum turns per iteration
         timeout: Timeout in seconds
         log_file: Log file handle
         system_prompt: Additional system prompt content
-        use_system_prompt_cache: Use outer template as system prompt for caching (always True)
-        outer_prompt_template: Outer template content
+        outer_prompt_template: Outer template content (cached)
+        task_prompt: The user's task (included in system prompt for caching)
 
     Returns:
         IterationResult with execution details
@@ -1214,19 +1248,13 @@ def run_claude_iteration(
         '--verbose'
     ]
 
-    # Compose system prompt
-    final_system_prompt = None
-
-    if use_system_prompt_cache and outer_prompt_template:
-        # Use outer template as system prompt for caching
-        final_system_prompt = outer_prompt_template
-        if system_prompt:
-            # Append custom system prompt
-            final_system_prompt = f"{outer_prompt_template}\n\n{system_prompt}"
-    elif system_prompt:
-        # Use custom system prompt only
-        final_system_prompt = system_prompt
-
+    final_system_prompt = compose_stable_instructions(
+        outer_prompt_template=outer_prompt_template,
+        task_prompt=task_prompt,
+        system_prompt=system_prompt,
+        max_turns=max_turns,
+        timeout_seconds=timeout,
+    )
     if final_system_prompt:
         cmd.extend(['--system-prompt', final_system_prompt])
 
@@ -1237,11 +1265,47 @@ def run_claude_iteration(
 
 def run_codex_iteration(
     prompt: str,
+    model: str = 'gpt-5.3-codex',
+    reasoning_effort: str = 'xhigh',
+    sandbox_mode: str = 'danger-full-access',
+    approval_policy: str = 'never',
+    max_turns: int = 50,
     timeout: int = 600,
-    log_file: Optional[TextIO] = None
+    log_file: Optional[TextIO] = None,
+    system_prompt: Optional[str] = None,
+    outer_prompt_template: Optional[str] = None,
+    task_prompt: Optional[str] = None,
 ) -> IterationResult:
-    """Run one iteration using Codex CLI."""
-    cmd = ['codex', 'exec', '-s', 'danger-full-access', prompt]
+    """
+    Run one iteration using Codex CLI.
+
+    Ralph's stable outer prompt + TASK are passed as Codex `developer_instructions`
+    to mirror Claude's system-prompt caching pattern as closely as possible.
+    """
+    developer_instructions = compose_stable_instructions(
+        outer_prompt_template=outer_prompt_template,
+        task_prompt=task_prompt,
+        system_prompt=system_prompt,
+        max_turns=max_turns,
+        timeout_seconds=timeout,
+    )
+
+    cmd = [
+        'codex',
+        '-s', sandbox_mode,
+        '-a', approval_policy,
+        'exec',
+        '--json',
+        '-m', model,
+        '-c', f'model_reasoning_effort="{reasoning_effort}"',
+    ]
+
+    if developer_instructions:
+        # Wrap in TOML triple-quoted string to safely pass arbitrary multi-line text.
+        escaped = developer_instructions.replace('\\', '\\\\').replace('"""', '\\"\\"\\"')
+        cmd.extend(['-c', f'developer_instructions="""{escaped}"""'])
+
+    cmd.append(prompt)
     return run_cli_iteration(cmd, 'codex', prompt, timeout, log_file)
 
 
@@ -1249,7 +1313,14 @@ def run_codex_iteration(
 # ITERATION LOGGING
 # ============================================================================
 
-def write_iteration_to_log(log_file: TextIO, result: IterationResult, command: list, max_iterations: int, model: str = None) -> None:
+def write_iteration_to_log(
+    log_file: TextIO,
+    result: IterationResult,
+    command: list,
+    max_iterations: int,
+    model: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
+) -> None:
     """Write iteration summary with consolidated metadata block."""
     write_to_log(log_file, "\n")
 
@@ -1271,6 +1342,8 @@ def write_iteration_to_log(log_file: TextIO, result: IterationResult, command: l
     write_log_box_line(log_file, f"  CLI: {cmd_str}")
     if model:
         write_log_box_line(log_file, f"  Model: {model}")
+    if reasoning_effort:
+        write_log_box_line(log_file, f"  Reasoning effort: {reasoning_effort}")
     write_log_box_line(log_file, f"  Prompt size: {result.input_tokens * 4} chars ({result.input_tokens:,} tokens est.)")
 
     # Divider
@@ -1392,47 +1465,28 @@ def load_outer_prompt(outer_prompt_path: str) -> str:
 
 
 def create_wrapped_prompt(
-    user_prompt: str,
     iteration_num: int,
-    outer_prompt_template: str,
     feedback: Optional[str] = None,
-    use_system_prompt: bool = False
 ) -> str:
     """
-    Create prompt for iteration.
+    Create the per-iteration user message.
+
+    The task and outer prompt template live in the system prompt (cached);
+    this only carries iteration metadata and optional feedback.
 
     Args:
-        user_prompt: The user's task
         iteration_num: Current iteration number
-        outer_prompt_template: Template with workflow instructions
         feedback: Feedback from previous iteration
-        use_system_prompt: If True, return minimal user prompt (template goes to system prompt)
 
     Returns:
         Formatted prompt string
     """
-    if use_system_prompt:
-        # Minimal user prompt - system prompt contains template
-        parts = [f"ITERATION: {iteration_num}"]
+    parts = [f"ITERATION: {iteration_num}"]
 
-        if feedback and iteration_num > 1:
-            parts.append(f"FEEDBACK: {feedback}")
+    if feedback and iteration_num > 1:
+        parts.append(f"FEEDBACK: {feedback}")
 
-        parts.append(f"TASK:\n{user_prompt}")
-
-        return "\n\n".join(parts)
-    else:
-        # Legacy mode - full wrapped prompt
-        feedback_section = ""
-        if feedback and iteration_num > 1:
-            separator = "=" * 60
-            feedback_section = f"\n\n{separator}\nFEEDBACK FROM PREVIOUS ITERATION:\n{separator}\n{feedback}\n{separator}\n"
-
-        return outer_prompt_template.format(
-            iteration_num=iteration_num,
-            user_prompt=user_prompt,
-            feedback=feedback_section
-        )
+    return "\n\n".join(parts)
 
 
 def get_concise_outer_prompt_path() -> Path:
@@ -1473,9 +1527,17 @@ def human_in_the_loop() -> bool:
             print("🛑 Stopping loop at user request")
             return False
         elif choice == 'g':
-            subprocess.run(['git', 'status'])
+            result = subprocess.run(['git', 'status'], capture_output=True, text=True)
+            if result.stdout:
+                print(result.stdout, end='')
+            if result.stderr:
+                print(result.stderr, end='', file=sys.stderr)
         elif choice == 'l':
-            subprocess.run(['git', 'log', '-5', '--oneline'])
+            result = subprocess.run(['git', 'log', '-5', '--oneline'], capture_output=True, text=True)
+            if result.stdout:
+                print(result.stdout, end='')
+            if result.stderr:
+                print(result.stderr, end='', file=sys.stderr)
         else:
             print("Invalid choice. Please enter c, s, g, or l")
 
@@ -1503,15 +1565,19 @@ Examples:
     parser.add_argument('prompt', nargs='?', help='The task prompt to feed to the agent')
     parser.add_argument('-f', '--prompt-file', type=str, help='Read the prompt from a file')
     parser.add_argument('--max-iterations', type=int, default=10, help='Maximum number of iterations (default: 10)')
-    parser.add_argument('--max-turns', type=int, default=50, help='Maximum turns per iteration for Claude CLI (default: 50)')
+    parser.add_argument('--max-turns', type=int, default=50, help='Maximum turns per iteration (Claude: passed to CLI; both: rendered into outer prompt) (default: 50)')
     parser.add_argument('--human-in-the-loop', action='store_true', help='Pause after each iteration for human review')
     parser.add_argument('--model', choices=['opus', 'sonnet', 'haiku'], default='opus', help='Model to use for Claude CLI (default: opus)')
     parser.add_argument('--cli-type', choices=['claude', 'codex'], default='claude', help='Which CLI to use (default: claude)')
+    parser.add_argument('--codex-model', type=str, default='gpt-5.3-codex', help='Model to use for Codex CLI (default: gpt-5.3-codex)')
+    parser.add_argument('--codex-reasoning-effort', choices=['low', 'medium', 'high', 'xhigh'], default='xhigh', help='Reasoning effort for Codex CLI (default: xhigh)')
+    parser.add_argument('--codex-sandbox', choices=['read-only', 'workspace-write', 'danger-full-access'], default='danger-full-access', help='Sandbox policy for Codex CLI (default: danger-full-access)')
+    parser.add_argument('--codex-approval-policy', choices=['untrusted', 'on-failure', 'on-request', 'never'], default='never', help='Shell command approval policy for Codex CLI (default: never)')
     parser.add_argument('--timeout', type=int, default=600, help='Timeout in seconds for each iteration (default: 600 = 10 minutes)')
     parser.add_argument('--timeout-total', type=int, default=None, help='Total timeout in seconds for entire ralph loop (default: None = no limit)')
     parser.add_argument('--log-file', type=str, default=None, help='Path to log file (default: /tmp/ralph_[work-dir-basename]_[timestamp]_iteration.log)')
     parser.add_argument('--outer-prompt', type=str, default=None, help='Path to outer prompt template file (default: package bundled outer-prompt-concise.md)')
-    parser.add_argument('--system-prompt', type=str, default=None, help='System prompt to pass to Claude CLI')
+    parser.add_argument('--system-prompt', type=str, default=None, help='Additional stable instructions appended to the outer prompt + task (Claude: system prompt; Codex: developer instructions)')
     parser.add_argument('--detach', action='store_true', help='Fork Ralph to run in background, exit immediately')
     parser.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
 
@@ -1561,7 +1627,11 @@ def print_final_summary(
 
     # Show final git status
     print("\n📊 Final git status:")
-    subprocess.run(['git', 'status', '--short'])
+    result = subprocess.run(['git', 'status', '--short'], capture_output=True, text=True)
+    if result.stdout:
+        print(result.stdout, end='')
+    if result.stderr:
+        print(result.stderr, end='', file=sys.stderr)
 
     # Show progress.md if it exists
     progress_file = Path('progress.md')
@@ -1589,7 +1659,9 @@ def write_run_summary(
     write_log_box_line(log_file, "RALPH LOOP RUN SUMMARY")
     write_log_box_divider(log_file, 67, heavy=True)
 
-    write_log_box_line(log_file, f"Task: {args.prompt[:55]}{'...' if len(args.prompt) > 55 else ''}")
+    # Remove newlines and extra whitespace from task prompt for single-line display
+    task_single_line = ' '.join(args.prompt.split())
+    write_log_box_line(log_file, f"Task: {task_single_line[:55]}{'...' if len(task_single_line) > 55 else ''}")
     write_log_box_line(log_file, f"Start: {start_time.strftime('%Y-%m-%d %H:%M:%S')} | End: {datetime.now().strftime('%H:%M:%S')}")
     write_log_box_line(log_file, f"Total elapsed: {elapsed}")
     write_log_box_line(log_file, f"Iterations: {iteration}/{args.max_iterations}")
@@ -1609,6 +1681,13 @@ def write_run_summary(
         if args.system_prompt:
             prompt_preview = args.system_prompt[:50] + ('...' if len(args.system_prompt) > 50 else '')
             write_log_box_line(log_file, f"  System prompt: {prompt_preview}")
+    else:
+        write_log_box_line(log_file, f"  Model: {args.codex_model}")
+        write_log_box_line(log_file, f"  Reasoning effort: {args.codex_reasoning_effort}")
+        write_log_box_line(log_file, f"  Sandbox: {args.codex_sandbox} | Approval: {args.codex_approval_policy}")
+        if args.system_prompt:
+            prompt_preview = args.system_prompt[:50] + ('...' if len(args.system_prompt) > 50 else '')
+            write_log_box_line(log_file, f"  Extra instructions: {prompt_preview}")
 
     write_log_box_line(log_file, f"  Max turns: {args.max_turns} | Timeout: {args.timeout}s")
 
@@ -1719,32 +1798,37 @@ def main() -> int:
             print(f"Total timeout: {args.timeout_total} seconds")
         print(f"CLI: {args.cli_type}")
 
+        template_tokens = estimate_tokens(outer_prompt_template)
+        task_tokens = estimate_tokens(args.prompt)
+        extra_tokens = estimate_tokens(args.system_prompt) if args.system_prompt else 0
+        stable_tokens = template_tokens + task_tokens + extra_tokens
+
         if args.cli_type == 'claude':
             print(f"Model: {args.model}")
-            template_tokens = estimate_tokens(outer_prompt_template)
-            print(f"Template size: {template_tokens:,} tokens (cached per iteration)")
-            if args.system_prompt:
-                print(f"Custom system prompt: {args.system_prompt[:50]}...")
+            print(f"System prompt: {stable_tokens:,} tokens (template + task + extras, cached)")
+        else:
+            print(f"Model: {args.codex_model}")
+            print(f"Reasoning effort: {args.codex_reasoning_effort}")
+            print(f"Sandbox: {args.codex_sandbox} | Approval: {args.codex_approval_policy}")
+            print(f"Developer instructions: {stable_tokens:,} tokens (template + task + extras, cached)")
+
+        if args.system_prompt:
+            preview = args.system_prompt[:50] + ('...' if len(args.system_prompt) > 50 else '')
+            print(f"Extra stable instructions: {preview}")
 
         print(f"Human-in-the-loop: {args.human_in_the_loop}")
         print(separator)
 
         # Calculate and display initial token count
-        initial_prompt = create_wrapped_prompt(
-            args.prompt,
-            1,
-            outer_prompt_template,
-            None,
-            use_system_prompt=True
-        )
-        initial_tokens = estimate_tokens(initial_prompt)
-        template_tokens = estimate_tokens(outer_prompt_template)
+        initial_prompt = create_wrapped_prompt(1)
+        user_msg_tokens = estimate_tokens(initial_prompt)
 
+        stable_label = "System prompt" if args.cli_type == 'claude' else "Developer instructions"
         print(f"\n📊 Token usage (estimated):")
-        print(f"   User prompt: {initial_tokens:,} tokens (sent each iteration)")
-        print(f"   Template: {template_tokens:,} tokens (cached, sent once)")
-        print(f"   Total first iteration: {initial_tokens + template_tokens:,} tokens")
-        print(f"   Subsequent iterations: ~{initial_tokens:,} tokens (cache hit)")
+        print(f"   {stable_label}: {stable_tokens:,} tokens (template + task + extras, cached)")
+        print(f"   User message: {user_msg_tokens:,} tokens (iteration metadata only)")
+        print(f"   Total first iteration: {stable_tokens + user_msg_tokens:,} tokens")
+        print(f"   Subsequent iterations: ~{user_msg_tokens:,} tokens ({stable_label.lower()} cached)")
         print(separator)
 
         # Print initial prompt once
@@ -1762,7 +1846,9 @@ def main() -> int:
         write_log_box_line(log_file, "Initial Configuration")
         write_log_box_divider(log_file, 67, heavy=False)
 
-        write_log_box_line(log_file, f"Task: {args.prompt[:55]}{'...' if len(args.prompt) > 55 else ''}")
+        # Remove newlines and extra whitespace from task prompt for single-line display
+        task_single_line = ' '.join(args.prompt.split())
+        write_log_box_line(log_file, f"Task: {task_single_line[:55]}{'...' if len(task_single_line) > 55 else ''}")
         write_log_box_line(log_file, f"Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         timeout_str = f"Max iterations: {args.max_iterations} | Max turns: {args.max_turns} | Timeout: {args.timeout}s"
         if args.timeout_total:
@@ -1774,8 +1860,14 @@ def main() -> int:
             write_log_box_line(log_file, f"Model: {args.model}")
             if args.system_prompt:
                 write_log_box_line(log_file, f"System prompt: {args.system_prompt[:50]}{'...' if len(args.system_prompt) > 50 else ''}")
+        else:
+            write_log_box_line(log_file, f"Model: {args.codex_model}")
+            write_log_box_line(log_file, f"Reasoning effort: {args.codex_reasoning_effort}")
+            write_log_box_line(log_file, f"Sandbox: {args.codex_sandbox} | Approval: {args.codex_approval_policy}")
+            if args.system_prompt:
+                write_log_box_line(log_file, f"Extra stable instructions: {args.system_prompt[:50]}{'...' if len(args.system_prompt) > 50 else ''}")
 
-        write_log_box_line(log_file, f"Prompt size: {len(initial_prompt)} chars ({initial_tokens:,} tokens est.)")
+        write_log_box_line(log_file, f"Prompt size: {len(initial_prompt)} chars ({user_msg_tokens:,} tokens est.)")
 
         write_log_box_divider(log_file, 67, heavy=False)
         write_log_box_line(log_file, "Streaming Output (real-time)")
@@ -1822,13 +1914,7 @@ def main() -> int:
 
             # Extract feedback and create wrapped prompt
             feedback = extract_iteration_feedback(previous_result) if previous_result else None
-            wrapped_prompt = create_wrapped_prompt(
-                args.prompt,
-                iteration,
-                outer_prompt_template,
-                feedback,
-                use_system_prompt=True
-            )
+            wrapped_prompt = create_wrapped_prompt(iteration, feedback)
 
             # Log prompt with diff for iterations > 1
             if iteration == 1:
@@ -1879,11 +1965,23 @@ def main() -> int:
                     args.timeout,
                     log_file,
                     args.system_prompt,
-                    use_system_prompt_cache=True,
-                    outer_prompt_template=outer_prompt_template
+                    outer_prompt_template=outer_prompt_template,
+                    task_prompt=args.prompt
                 )
             else:
-                result = run_codex_iteration(wrapped_prompt, args.timeout, log_file)
+                result = run_codex_iteration(
+                    wrapped_prompt,
+                    model=args.codex_model,
+                    reasoning_effort=args.codex_reasoning_effort,
+                    sandbox_mode=args.codex_sandbox,
+                    approval_policy=args.codex_approval_policy,
+                    max_turns=args.max_turns,
+                    timeout=args.timeout,
+                    log_file=log_file,
+                    system_prompt=args.system_prompt,
+                    outer_prompt_template=outer_prompt_template,
+                    task_prompt=args.prompt,
+                )
 
             result.iteration_num = iteration
 
@@ -1895,9 +1993,26 @@ def main() -> int:
                     cmd_used.extend(['--system-prompt', args.system_prompt])
                 cmd_used.extend(['-p', '[prompt]'])
             else:
-                cmd_used = ['codex', 'exec', '-s', 'danger-full-access', '[prompt]']
+                cmd_used = [
+                    'codex',
+                    '-s', args.codex_sandbox,
+                    '-a', args.codex_approval_policy,
+                    'exec',
+                    '--json',
+                    '-m', args.codex_model,
+                    '-c', f'model_reasoning_effort="{args.codex_reasoning_effort}"',
+                    '-c', 'developer_instructions=[omitted]',
+                    '[prompt]',
+                ]
 
-            write_iteration_to_log(log_file, result, cmd_used, args.max_iterations, args.model if args.cli_type == 'claude' else None)
+            write_iteration_to_log(
+                log_file,
+                result,
+                cmd_used,
+                args.max_iterations,
+                model=args.model if args.cli_type == 'claude' else args.codex_model,
+                reasoning_effort=args.codex_reasoning_effort if args.cli_type == 'codex' else None,
+            )
 
             # Update cumulative tokens
             cumulative_input_tokens += result.input_tokens
@@ -1911,7 +2026,7 @@ def main() -> int:
                 print(f"\n{separator}")
                 print("⚠️  COMPACTION DETECTED")
                 print(separator)
-                print("Claude was about to compact the conversation.")
+                print("The agent was about to compact the conversation.")
                 print("Iteration terminated early to preserve context.")
                 print("Moving to next iteration...")
                 print(separator)
