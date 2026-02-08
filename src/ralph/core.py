@@ -147,6 +147,30 @@ def truncate_text(text: str, max_len: int, smart: bool = True, indicator: str = 
     return truncated + indicator
 
 
+def first_present(d: dict, *keys: str, default=None):
+    """Return the first non-None value for the given keys."""
+    for k in keys:
+        if k in d and d[k] is not None:
+            return d[k]
+    return default
+
+
+def normalize_codex_event_type(event_type: str) -> str:
+    """Normalize Codex JSONL event types to a consistent snake_case form."""
+    return event_type.replace('.', '_').strip()
+
+
+def format_codex_command(command) -> str:
+    """Best-effort conversion of Codex command payload into a readable string."""
+    if command is None:
+        return ''
+    if isinstance(command, str):
+        return command
+    if isinstance(command, list):
+        return ' '.join(str(x) for x in command if x is not None)
+    return str(command)
+
+
 def estimate_tokens(text: str) -> int:
     """
     Estimate token count from text using characters / 4 heuristic.
@@ -667,6 +691,7 @@ def process_json_line(
         json_obj = json.loads(line)
         msg_type = json_obj.get('type', '')
 
+        # Claude Code stream-json events
         if msg_type == 'assistant':
             # Handle tool invocations
             message = json_obj.get('message', {})
@@ -698,6 +723,10 @@ def process_json_line(
         elif msg_type == 'result':
             handle_final_result(json_obj, timestamp, log_file)
 
+        # Codex CLI exec --json events (JSONL). These have a different schema.
+        elif process_codex_json_obj(json_obj, timestamp, log_file, tool_map):
+            return
+
         elif msg_type not in ['system']:
             # Log other types (truncated)
             if len(line) > TRUNCATE_JSON_LOG:
@@ -708,6 +737,308 @@ def process_json_line(
     except (json.JSONDecodeError, KeyError, TypeError):
         # Not JSON or malformed, log as-is
         write_to_log(log_file, f"[{timestamp}] {line}\n")
+
+
+def _codex_extract_file_change_display(changes) -> str:
+    """Build a display string from a Codex file_change changes list."""
+    paths = []
+    if isinstance(changes, list):
+        for ch in changes:
+            if isinstance(ch, dict):
+                p = first_present(ch, 'path', 'file_path', 'filePath',
+                                  'absolute_file_path', 'absoluteFilePath')
+                if p:
+                    paths.append(str(p))
+    if len(paths) == 1:
+        return paths[0]
+    if len(paths) > 1:
+        return f"{paths[0]} (+{len(paths) - 1} more)"
+    if isinstance(changes, list) and changes:
+        return f"{len(changes)} files"
+    return 'patch'
+
+
+def _handle_codex_item_started(item: dict, timestamp: str, log_file: TextIO, tool_map: dict) -> bool:
+    """Handle a Codex item.started event."""
+    item_type = item.get('type', '')
+    item_id = item.get('id', '')
+
+    if item_type == 'command_execution':
+        command = format_codex_command(item.get('command'))
+        handle_tool_invocation('Bash', str(item_id), {'command': command}, timestamp, log_file, tool_map)
+        return True
+
+    return False
+
+
+def _handle_codex_item_completed(item: dict, timestamp: str, log_file: TextIO, tool_map: dict) -> bool:
+    """Handle a Codex item.completed event."""
+    item_type = item.get('type', '')
+    item_id = item.get('id', '')
+
+    if item_type == 'command_execution':
+        # Synthesize begin if we missed item.started
+        if str(item_id) not in tool_map:
+            command = format_codex_command(item.get('command'))
+            handle_tool_invocation('Bash', str(item_id), {'command': command}, timestamp, log_file, tool_map)
+
+        exit_code = item.get('exit_code')
+        aggregated = item.get('aggregated_output', '')
+        status = item.get('status', '')
+
+        if exit_code is None and status != 'completed':
+            err_msg = item.get('error') or 'Command execution failed'
+            if isinstance(err_msg, dict):
+                err_msg = err_msg.get('message') or json.dumps(err_msg)
+            handle_tool_result(str(item_id), f"<error>{err_msg}</error>", True, timestamp, log_file, tool_map)
+        else:
+            result_content = str(aggregated) if aggregated else ''
+            ec = int(exit_code) if exit_code is not None else 0
+            result_content = f"{result_content}\nExit code: {ec}"
+            handle_tool_result(str(item_id), result_content, False, timestamp, log_file, tool_map)
+        return True
+
+    if item_type == 'file_change':
+        changes = item.get('changes') or []
+        display = _codex_extract_file_change_display(changes)
+        status = item.get('status', 'completed')
+        # file_change arrives as a single completed event; emit both invocation and result.
+        handle_tool_invocation('Edit', str(item_id), {'file_path': display}, timestamp, log_file, tool_map)
+        if status == 'completed':
+            handle_tool_result(str(item_id), display, False, timestamp, log_file, tool_map)
+        else:
+            err_msg = item.get('error') or 'File change failed'
+            if isinstance(err_msg, dict):
+                err_msg = err_msg.get('message') or json.dumps(err_msg)
+            handle_tool_result(str(item_id), f"<error>{err_msg}</error>", True, timestamp, log_file, tool_map)
+        return True
+
+    if item_type == 'reasoning':
+        text = item.get('text', '')
+        if text:
+            write_to_log(log_file, f"[{timestamp}] [REASONING] {truncate_text(text, TRUNCATE_TOOL_RESULT)}\n")
+        return True
+
+    if item_type == 'agent_message':
+        text = item.get('text', '')
+        if text:
+            write_to_log(log_file, f"[{timestamp}] [TEXT] {text}\n")
+        return True
+
+    return False
+
+
+def process_codex_json_obj(json_obj: dict, timestamp: str, log_file: TextIO, tool_map: dict) -> bool:
+    """
+    Process a Codex CLI JSONL event.
+
+    Codex CLI v0.98+ emits item.started / item.completed events with item types:
+      - command_execution: shell commands (maps to Bash tool)
+      - file_change: file edits (maps to Edit tool)
+      - reasoning: model thinking (logged to file)
+      - agent_message: model text output (logged to file)
+
+    Legacy exec.command.* and patch.apply.* handlers are kept for backward
+    compatibility with older Codex versions.
+
+    Returns True if the event was handled; False to fall back to generic logging.
+    """
+    raw_type = str(json_obj.get('type', '') or '')
+    if not raw_type:
+        return False
+
+    msg_type = normalize_codex_event_type(raw_type)
+
+    # ── Item-based events (Codex CLI v0.98+) ──────────────────────────
+    if msg_type == 'item_started':
+        item = json_obj.get('item', {})
+        if item and _handle_codex_item_started(item, timestamp, log_file, tool_map):
+            return True
+        return True  # Suppress unhandled item.started subtypes
+
+    if msg_type == 'item_completed':
+        item = json_obj.get('item', {})
+        if item and _handle_codex_item_completed(item, timestamp, log_file, tool_map):
+            return True
+        return True  # Suppress unhandled item.completed subtypes
+
+    # ── Legacy event types (older Codex versions) ─────────────────────
+
+    # Command execution (exec.command.begin/end)
+    if msg_type == 'exec_command_begin':
+        call_id = first_present(
+            json_obj,
+            'call_id', 'callId', 'id',
+            'codex_call_id', 'codexCallId',
+            'codex_event_id', 'codexEventId',
+            'event_id', 'eventId',
+        )
+        if not call_id:
+            return False
+        command = format_codex_command(first_present(
+            json_obj,
+            'command', 'cmd', 'argv',
+            'shell_command', 'shellCommand',
+            'parsed_cmd', 'parsedCmd',
+        ))
+        handle_tool_invocation('Bash', str(call_id), {'command': command}, timestamp, log_file, tool_map)
+        return True
+
+    if msg_type == 'exec_command_output_delta':
+        return True
+
+    if msg_type == 'exec_command_end':
+        call_id = first_present(
+            json_obj,
+            'call_id', 'callId', 'id',
+            'codex_call_id', 'codexCallId',
+            'codex_event_id', 'codexEventId',
+            'event_id', 'eventId',
+        )
+        if not call_id:
+            return False
+        if str(call_id) not in tool_map:
+            command = format_codex_command(first_present(
+                json_obj,
+                'command', 'cmd', 'argv',
+                'shell_command', 'shellCommand',
+                'parsed_cmd', 'parsedCmd',
+            ))
+            handle_tool_invocation('Bash', str(call_id), {'command': command}, timestamp, log_file, tool_map)
+        exit_code = first_present(json_obj, 'exit_code', 'exitCode')
+        stdout = first_present(json_obj, 'stdout', 'captured_stdout', 'capturedStdout')
+        stderr = first_present(json_obj, 'stderr', 'captured_stderr', 'capturedStderr')
+        aggregated = first_present(json_obj, 'aggregated_output', 'aggregatedOutput',
+                                   'formatted_output', 'formattedOutput')
+        if aggregated is None:
+            parts = []
+            if stdout:
+                parts.append(str(stdout))
+            if stderr:
+                parts.append(str(stderr))
+            aggregated = "\n".join(parts)
+        if exit_code is None:
+            err = first_present(json_obj, 'error', 'message')
+            if isinstance(err, dict):
+                err = err.get('message') or json.dumps(err)
+            err_msg = str(err) if err else 'Unknown exec_command error'
+            handle_tool_result(str(call_id), f"<error>{err_msg}</error>", True, timestamp, log_file, tool_map)
+            return True
+        result_content = (str(aggregated) if aggregated is not None else '')
+        result_content = f"{result_content}\nExit code: {int(exit_code)}"
+        handle_tool_result(str(call_id), result_content, False, timestamp, log_file, tool_map)
+        return True
+
+    # Patch application (patch.apply.begin/end)
+    if msg_type == 'patch_apply_begin':
+        call_id = first_present(
+            json_obj,
+            'call_id', 'callId', 'id',
+            'codex_call_id', 'codexCallId',
+            'codex_event_id', 'codexEventId',
+            'event_id', 'eventId',
+        )
+        if not call_id:
+            return False
+        changes = first_present(json_obj, 'changes', 'file_changes', 'fileChanges') or []
+        display = _codex_extract_file_change_display(changes)
+        handle_tool_invocation('Edit', str(call_id), {'file_path': display}, timestamp, log_file, tool_map)
+        return True
+
+    if msg_type == 'patch_apply_end':
+        call_id = first_present(
+            json_obj,
+            'call_id', 'callId', 'id',
+            'codex_call_id', 'codexCallId',
+            'codex_event_id', 'codexEventId',
+            'event_id', 'eventId',
+        )
+        if not call_id:
+            return False
+        if str(call_id) not in tool_map:
+            handle_tool_invocation('Edit', str(call_id), {'file_path': 'patch'}, timestamp, log_file, tool_map)
+        ok = first_present(json_obj, 'ok', 'applied', 'success')
+        stdout = first_present(json_obj, 'stdout', 'captured_stdout', 'capturedStdout') or ''
+        stderr = first_present(json_obj, 'stderr', 'captured_stderr', 'capturedStderr') or ''
+        if ok is False:
+            err_msg = str(stderr) if stderr else 'Patch apply failed'
+            handle_tool_result(str(call_id), f"<error>{err_msg}</error>", True, timestamp, log_file, tool_map)
+        else:
+            handle_tool_result(str(call_id), str(stdout), False, timestamp, log_file, tool_map)
+        return True
+
+    # ── Turn lifecycle ────────────────────────────────────────────────
+    if msg_type in ('turn_completed', 'turn_failed'):
+        subtype = 'success' if msg_type == 'turn_completed' else 'failed'
+
+        # Extract token usage (Codex provides usage in turn events)
+        usage = json_obj.get('usage', {})
+        input_tokens = usage.get('input_tokens', 0) or 0
+        cached_tokens = usage.get('cached_input_tokens', 0) or 0
+        output_tokens = usage.get('output_tokens', 0) or 0
+
+        # Also check for duration/turns (may be present in some versions)
+        duration_ms = first_present(json_obj, 'duration_ms', 'durationMs', default=0) or 0
+        num_turns = first_present(json_obj, 'num_turns', 'numTurns', default=0) or 0
+
+        # Write to log file (matching Claude's handle_final_result format)
+        log_parts = [f"[{timestamp}] [FINAL_RESULT] Status: {subtype}\n"]
+        if duration_ms:
+            log_parts.append(f"[{timestamp}]   Duration: {duration_ms}ms\n")
+        if num_turns:
+            log_parts.append(f"[{timestamp}]   Turns: {num_turns}\n")
+        if input_tokens or output_tokens:
+            log_parts.append(f"[{timestamp}]   Tokens: {input_tokens:,} in"
+                             f" ({cached_tokens:,} cached) / {output_tokens:,} out\n")
+        write_to_log(log_file, ''.join(log_parts))
+
+        # Console output (matching Claude's format)
+        lines = [f"\n--- Iteration Complete: {subtype} ---"]
+        meta_parts = []
+        if duration_ms:
+            try:
+                duration_sec = float(duration_ms) / 1000.0
+                meta_parts.append(f"Duration: {duration_sec:.1f}s")
+            except Exception:
+                pass
+        if num_turns:
+            meta_parts.append(f"Turns: {num_turns}")
+        if input_tokens or output_tokens:
+            meta_parts.append(f"Tokens: {input_tokens:,} in / {output_tokens:,} out")
+        if meta_parts:
+            lines.append(" | ".join(meta_parts))
+
+        if msg_type == 'turn_failed':
+            err = first_present(json_obj, 'error', 'message')
+            if isinstance(err, dict):
+                err = err.get('message') or json.dumps(err)
+            err_msg = str(err) if err else ''
+            if err_msg:
+                lines.append(f"  ✗ {truncate_text(err_msg, TRUNCATE_ERROR_MSG)}")
+
+        console_print("\n".join(lines))
+        return True
+
+    # ── Noise suppression ─────────────────────────────────────────────
+    if msg_type in (
+        'thread_started', 'turn_started',
+        'item_updated',
+        'agent_message_delta', 'agent_message_content_delta',
+        'reasoning_content_delta', 'reasoning_raw_content_delta',
+    ):
+        return True
+
+    # ── Error events ──────────────────────────────────────────────────
+    if msg_type == 'error':
+        err = first_present(json_obj, 'message', 'error')
+        if isinstance(err, dict):
+            err = err.get('message') or json.dumps(err)
+        err_msg = str(err) if err else 'Unknown error'
+        write_to_log(log_file, f"[{timestamp}] [ERROR] {err_msg}\n")
+        console_print(f"  ✗ Error: {truncate_text(err_msg, TRUNCATE_ERROR_MSG)}")
+        return True
+
+    return False
 
 
 def check_compaction_signal(line: str, logger: DetailedLogger) -> bool:
